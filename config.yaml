@@ -43,9 +43,11 @@ robot:
     #   先假設是手臂正下方一根直徑 10 cm 的柱子。右側還有相機桿（base_action.py 註解），位置未知、尚未加入。
     extra_spheres: [[0.08, 0.0, 0.15, 0.05], [0.08, 0.0, 0.24, 0.05], [0.08, 0.0, 0.33, 0.05], [0.08, 0.0, 0.42, 0.05]]
 
-  # 開車時手臂收起的姿態（6 軸，弧度）。實驗室 mm_actions 放下／遞交後回到的 home 姿態是全零
-  # （actions/place.py、handover.py 的 home_joint_state）。null = 用 robot129.yml 的 default_joint_position。
-  stow_arm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  # 開車時手臂收起的姿態（6 軸，弧度），也是到位後手臂軌跡的起點。用實驗室 mm_actions 夾到東西後的收起姿態
+  # （actions/grasp.py 的 home_joint_state），夾爪在車頭前 0.22 m、離地 0.81 m。
+  # 實驗室空手時的 home 是全零（place.py、handover.py），但那是完全折疊的姿態，robot129 的碰撞球在那裡互相重疊，
+  # cuRobo 會判定起點自我碰撞而拒絕規劃。實機上先從全零移到這個姿態即可。null = 用 robot129.yml 的預設姿態。
+  stow_arm: [0.0, 0.2, -0.6, 0.0, 0.8, 0.0]
 
 search:
   # 虛擬關節的搜尋視窗（相對於目前位置）；再與 SLAM 已知區域取交集
