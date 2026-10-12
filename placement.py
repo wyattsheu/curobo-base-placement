@@ -81,7 +81,10 @@ class BasePlacementPlanner:
         st = self.planner.default_joint_state
         stow = cfg["robot"].get("stow_arm")
         self.stow = np.array(stow if stow else [float(st.position.reshape(-1)[list(st.joint_names).index(j)]) for j in ARM_JOINTS])
-        self.start = st.clone().unsqueeze(0)
+        start = st.clone(); flat = start.position.view(-1); names = list(start.joint_names)
+        for j, v in zip(ARM_JOINTS, self.stow):                 # the arm trajectory starts from the stowed arm
+            flat[names.index(j)] = float(v)
+        self.start = start.unsqueeze(0)
         for _ in range(2):                                      # warm-up (CUDA graphs)
             self.ik_wb.solve_pose(self.goal_from(np.zeros((1, 3))), return_seeds=P["wb_seeds"])
         self.robustness(np.zeros((self.group, 3)))
