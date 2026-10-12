@@ -24,7 +24,9 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Cuboid, Scene
 from curobo.types import GoalToolPose, Pose
 
-from robot_model import robot_cfg, in_safety_cone, footprint_xy, BASE_JOINTS, ARM_JOINTS
+from robot_model import robot_cfg, in_safety_cone, footprint_xy, n_collision_spheres, BASE_JOINTS, ARM_JOINTS
+
+MPPI_PARTICLES = 25          # particles per seed in cuRobo v2's IK MPPI stage (sets the kernel size above)
 from scene_io import base_to_map_pose
 
 
@@ -58,7 +60,11 @@ class BasePlacementPlanner:
         cache = {"cuboid": max(P["collision_cache_cuboids"], len(B) + 2)}
         d, a = Rb["perturb_xy_m"], math.radians(Rb["perturb_yaw_deg"])
         self.OFFS = np.array([(dx, dy, dp) for dx in (-d, 0, d) for dy in (-d, 0, d) for dp in (-a, 0, a)])
-        self.group = P["scorer_group"]
+        # one warp kernel covers envs x seeds x particles x robot spheres x cuboids and must stay below 2^31 work items:
+        # with many boxes (real maps) or many spheres, score fewer stations per call instead of failing
+        per_station = len(self.OFFS) * P["scorer_seeds"] * MPPI_PARTICLES * n_collision_spheres(cfg) * cache["cuboid"]
+        self.group = max(1, min(P["scorer_group"], (2**31 - 1) // per_station))
+        self.T["scorer_group_used"] = float(self.group)
         rc_wb, rc_arm = robot_cfg(cfg, False, self.window), robot_cfg(cfg, True)
         # 1. whole-body IK: one problem (the decided gripper pose)
         self.ik_wb = InverseKinematics(InverseKinematicsCfg.create(robot=rc_wb, scene_model=self.scene_at((0, 0, 0)),

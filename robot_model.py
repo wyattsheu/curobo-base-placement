@@ -143,3 +143,9 @@ def footprint_xy(cfg, nx=3, ny=3):
     """Sample points of the Kachaka body outline in the base frame (body centre is ahead of the turning axis)."""
     k = cfg["robot"]["kachaka"]; L, W = k["size_m"][:2]; cx, cy = k.get("body_center_xy", [0.0, 0.0])
     return np.array([[cx + x, cy + y] for x in np.linspace(-L / 2, L / 2, nx) for y in np.linspace(-W / 2, W / 2, ny)])
+
+
+def n_collision_spheres(cfg):
+    """Number of collision spheres of the full robot (arm + Kachaka body), as cuRobo will see them."""
+    k = robot_dict(cfg)["kinematics"]
+    return sum(len(k["collision_spheres"].get(l, []) or []) for l in k["collision_link_names"])

@@ -36,9 +36,9 @@ robot:
   kachaka:
     size_m: [0.387, 0.240, 0.525]       # 長(x)、寬(y)、高(z)：車身 + 支架，到手臂底座為止
     body_center_xy: [0.0435, 0.0]       # 車身中心相對於轉軸（base 原點）
-    sphere_radius: 0.05
-    sphere_z: 0.065                     # 最底層球心高度；球底離地 1.5 cm，不要讓球貼地（浮點誤差會讓碰撞判定亂跳）
-    sphere_grid: [6, 3]                 # 每層沿 x 6 顆、沿 y 3 顆的外圈（間距小於直徑，中間沒有縫）
+    sphere_radius: 0.06
+    sphere_z: 0.075                     # 最底層球心高度；球底離地 1.5 cm，不要讓球貼地（浮點誤差會讓碰撞判定亂跳）
+    sphere_grid: [5, 3]                 # 每層沿 x 5 顆、沿 y 3 顆的外圈（間距小於直徑，中間沒有縫）
     # ★ 機身上其他會撞到的東西，每顆球 [x, y, z, r]，base 座標。右側的相機桿（base_action.py 註解）位置未知、尚未加入。
     extra_spheres: []
 
@@ -65,7 +65,7 @@ profile:
   wb_seeds: 128                         # whole-body IK 種子數（只有一個夾爪位姿，一次呼叫）
   wb_rounds_max: 4                      # 候選太少時最多再解幾輪（每輪重新抽種子）
   min_candidates: 15                    # 可停車的候選站位至少要這麼多才開始評分
-  scorer_group: 4                       # 評分：每次 GPU 呼叫評幾個站位（4 × 27 = 108 題）
+  scorer_group: 4                       # 評分：每次 GPU 呼叫評幾個站位（4 × 27 = 108 題）；方塊很多時自動減少
   scorer_seeds: 16
   planner_ik_seeds: 8
   planner_trajopt_seeds: 1
