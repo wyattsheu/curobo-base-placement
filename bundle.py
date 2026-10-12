@@ -1,4 +1,4 @@
-"""Pack mobile_grasp (code + config + inputs) into ONE script that can be piped to a remote Python:
+"""Pack curobo_base_placement (code + config + inputs) into ONE script that can be piped to a remote Python:
 
     python bundle.py | ssh <server> 'cd /tmp && <cuRobo env>/bin/python -'
 

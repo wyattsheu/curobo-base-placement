@@ -1,4 +1,4 @@
-# mobile_grasp：被擋住時，Kachaka 要移到哪裡才抓得到（cuRobo v2）
+# curobo-base-placement：用 cuRobo 最佳化找出 Kachaka 該停在哪裡才抓得到
 
 上游已經決定好**抓什麼**和**夾爪最終位姿**（位置＋朝向），但原地被障礙物擋住抓不到。這個專案只做一件事：
 
@@ -121,7 +121,7 @@ python bundle.py --npz /maps/xxx.npz --request request.json | ssh <server> '…'
 ## 4. 檔案
 
 ```
-mobile_grasp/
+curobo_base_placement/
 ├─ config.yaml        ← 所有假設值與參數（量到實際數值只改這裡）
 ├─ run_demo.py        ← 入口：讀點雲與請求 → 規劃 → 印出 JSON
 ├─ scene_io.py        ← 點雲 + 請求 → 規劃器要的格式（障礙方塊、已知區域、base 座標的夾爪位姿）
