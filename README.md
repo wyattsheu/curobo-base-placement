@@ -151,20 +151,20 @@ curobo_base_placement/
 ## 5. 資料流（檔案:行號）
 
 ```
-slam.npz + request.json（map 座標）
-   │ scene_io.py:258 scene_from_slam()
-   │   :274 目標物點（遮罩 → 類別 → 圓柱退路，:297）   :288 已知區域   :306 障礙點
-   │   :190 objects_to_boxes()  依類別 → 3D 連通物體 → :169 依高度分層 → :124 decompose() 包方塊
+slam.npz + request.json（map 座標）   或   --lab-map 實驗室匯出資料夾（lab_map.py）
+   │ scene_io.py:330 scene_from_slam()
+   │   :383 目標物點（遮罩 / instance id → 類別 → 圓柱退路，再往外長 3 cm）   :367 已知區域（或 :317 Kachaka 2D 地圖）   :402 障礙點
+   │   :237 objects_to_boxes()  依類別 → 3D 連通物體 → :216 依高度分層 → :171 decompose() 包方塊（不填目標物的位置）
    ▼
 PlanningScene（base 座標 = Kachaka 現在的位置）
-   │ placement.py:46 BasePlacementPlanner(cfg, scene)   一次建好所有 solver（約 9 s，開機時做一次）
-   │ placement.py:204 plan()
-   │   1 :126 whole_body()   9 軸 IK：同一個夾爪位姿 → 很多候選站位 (x, y, ψ)
-   │   2 :196 _candidates()  ±30° 護欄（robot_model.py:124）＋ :135 parking_ok() 停車不撞、在已知區域
-   │   3 :158 robustness()   由近到遠，27 種到位誤差各重解 6 軸 IK
-   │   4 :178 plan_arm()     底盤鎖住，6 軸 MotionPlanner；失敗就換下一個（:233 都沒達標時用最穩健的）
+   │ placement.py:48 BasePlacementPlanner(cfg, scene)   一次建好所有 solver（約 7 s，開機時做一次）
+   │ placement.py:209 plan()
+   │   1 :132 whole_body()   9 軸 IK：同一個夾爪位姿 → 很多候選站位 (x, y, ψ)
+   │   2 :201 _candidates()  ±30° 護欄（robot_model.py:133）＋ :141 parking_ok() 底盤不撞、在可行駛區域
+   │   3 :163 robustness()   由近到遠，27 種到位誤差各重解 6 軸 IK
+   │   4 :183 plan_arm()     底盤鎖住，從收起姿態做 6 軸 MotionPlanner；失敗就換下一個（:238 都沒達標時用最穩健的）
    ▼
-chosen_map → Navigate_to_pose；arm.traj → 到位後的手臂
+chosen_map → Navigate_to_pose；arm.traj、at_goal.grasp_pose_in_piper_base → 到位後的手臂
 ```
 
 | 座標系 | 定義 | 轉換 |
@@ -176,7 +176,7 @@ chosen_map → Navigate_to_pose；arm.traj → 到位後的手臂
 
 | 量到的東西 | 欄位 | 進到程式的哪裡 |
 |---|---|---|
-| 手臂裝在 Kachaka 的位置 | `robot.arm_mount_xyz`、`arm_mount_rpy_deg` | `robot_model.py:82`（運動鏈）、`:124`（護欄）|
+| 手臂裝在 Kachaka 的位置 | `robot.arm_mount_xyz`、`arm_mount_rpy_deg` | `robot_model.py:91`（運動鏈）、`:133`（護欄）|
 | Kachaka 實際尺寸 | `robot.kachaka.size_m` | 碰撞球、停車檢查 |
 | 相機桿等凸出物 | `robot.kachaka.extra_spheres` | 碰撞球 |
 | 開車時手臂收起的姿態 | `robot.stow_arm`（目前用實驗室 mm_actions 的 home 姿態：全零）| 停車檢查、手臂規劃起點 |
@@ -189,10 +189,11 @@ chosen_map → Navigate_to_pose；arm.traj → 到位後的手臂
 ## 7. 已知限制
 
 - 手臂安裝位置 (0.08, 0, 0.525)、Kachaka 車身（0.387 × 0.240 × 0.095 m，中心在轉軸前 4.35 cm）、工具點（gripper_base 前 0.12 m）
-  取自實驗室的 `kachaka_piper.urdf.xacro` 與 mm_actions；**撐起手臂的支架形狀未量測**（先用一根柱子近似，config 標 ★），
-  右側相機桿尚未加入；到位誤差 ±5 cm／±5° 是假設值。
+  取自實驗室的 `kachaka_piper.urdf.xacro` 與 mm_actions。底盤上方撐起手臂的支架（和車身同樣大小、到 0.525 m）不建模：
+  底盤只問「能不能停」（底盤的碰撞球 + Kachaka 2D 地圖），碰撞只在規劃手臂時檢查。右側相機桿尚未加入；到位誤差 ±5 cm／±5° 是假設值。
+- 收起姿態用 mm_actions 夾到東西後的姿態；空手的 home（全零）完全折疊，robot129 的碰撞球在那裡重疊，cuRobo 會拒絕當起點。
 - 需確認：SLAM 與 Kachaka 用同一張地圖座標、地板在 z ≈ 0；上游夾爪位姿用的 frame 是 `pinch_center`。
 - 點雲轉出的方塊比實物大約 1–2 cm（含安全餘量）；桌下等懸空空間會被當成實心。
 - 穩健度用 16 個 IK 種子評分，每次執行會有跳動（同一站位 0.85–0.96），常常走「用最穩健的」退路；可調 `profile.scorer_seeds` 或 `robustness.threshold`。
-- cuRobo v2 這個版本的 `collision_checking.validate()` 有 bug，停車檢查改用 cuRobo FK ＋自己算方塊距離（`placement.py:135`）。
+- 停車檢查只用底盤的 10 顆球，直接用 numpy 算到方塊的距離（`placement.py:141`）；cuRobo v2 這個版本的 `collision_checking.validate()` 有 bug，沒有使用。
 - 時間只在 RTX PRO 6000 上量過（solver 建立約 9 s 一次性；找站位到手臂規劃約 1.5 s；GPU 峰值約 0.7 GB），Thor 上需要實測。
