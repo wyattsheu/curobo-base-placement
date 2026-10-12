@@ -1,0 +1,5 @@
+# cuRobo v2 (NVlabs/curobo, commit 4ea7736 "cuRoboV2 research release", 0.8.0) and PyTorch with CUDA are
+# installed separately, following cuRobo's instructions. Map conversion (scene_io.py) needs only these:
+numpy
+scipy
+PyYAML

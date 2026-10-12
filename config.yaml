@@ -1,0 +1,86 @@
+# ============================================================================
+# 任務：上游已決定「抓什麼、夾爪最終位姿（位置＋朝向）」，但發現有障礙物而交給這裡。
+#       這裡只做：根據 3D SLAM 地圖，決定 Kachaka 要移到哪裡，並確認移過去後用「那個夾爪位姿」還抓得到。
+# 量到實際數值時，只需要改這個檔案。
+#
+# 座標系（右手系，公尺、弧度）：
+#   map        SLAM 地圖座標（須與 Kachaka 定位的地圖相同）
+#   base       Kachaka 目前所在位置：底盤中心投影到地面，x 朝車頭、z 朝上。規劃全部在這裡做，
+#              虛擬關節 (x, y, ψ) = 「從現在的位置要移多少」
+#   arm_base   Piper URDF 的 base_link
+# ============================================================================
+
+robot:
+  # cuRobo 用的 Robot129 設定（碰撞球、URDF 路徑都在裡面），已隨專案放在 assets/，路徑相對於這個檔案。
+  # yml 裡的 urdf_path / asset_root_path 相對於 yml 本身（robot_model.robot_dict 會換成絕對路徑）。
+  curobo_yml: assets/robot129.yml
+  tool_frame: pinch_center              # 上游給的「夾爪位姿」指的是這個 frame（robot129.yml 定義）
+
+  # ★ 手臂裝在 Kachaka 上的位置 ← 目前是估計值，量測後改這兩行
+  #   = arm_base 原點在 base 座標中的位置與朝向
+  #   量法：手臂 joint1 轉軸與 Kachaka 頂面的交點 → 到底盤中心的前後(x)、左右(y，左正)距離，
+  #         頂面離地高度(z)；手臂正前方與車頭的夾角(yaw)。
+  arm_mount_xyz: [0.12, 0.0, 0.124]
+  arm_mount_rpy_deg: [0.0, 0.0, 0.0]
+
+  # 實機護欄（mm_actions/actions/base_action.py）
+  joint1_limit_rad: 0.6                 # J1_LIMIT_RAD
+  bearing_limit_rad: 0.52               # SAFE_BEARING_RAD：目標方位須在手臂正面 ±30° 內
+
+  # Kachaka 本體碰撞模型（base 座標）。尺寸取自 Kachaka Pro 規格表，實機請確認型號。
+  kachaka:
+    size_m: [0.387, 0.240, 0.124]       # 長(x)、寬(y)、高(z)
+    sphere_radius: 0.058
+    sphere_z: 0.073                     # 球心高度；球底離地 1.5 cm，不要讓球貼地（浮點誤差會讓碰撞判定亂跳）
+    sphere_grid: [5, 2]                 # 沿 x 5 顆、沿 y 2 顆
+    # ★ 機身上其他會撞到的東西（例如右後方的相機桿），每顆球 [x, y, z, r]，base 座標
+    extra_spheres: []
+    #   例：extra_spheres: [[-0.15, -0.09, 0.25, 0.03], [-0.15, -0.09, 0.40, 0.03], [-0.15, -0.09, 0.55, 0.03]]
+
+  # 開車時手臂收起的姿態（6 軸，弧度）。null = 用 robot129.yml 的 default_joint_position
+  stow_arm: null
+
+search:
+  # 虛擬關節的搜尋視窗（相對於目前位置）；再與 SLAM 已知區域取交集
+  window_x: [-1.5, 1.5]
+  window_y: [-1.5, 1.5]
+  yaw_limit_rad: 3.14159
+
+robustness:
+  # 導航到位誤差：±xy、±yaw 各取三點（-, 0, +）共 27 種。← 用 Kachaka 實測誤差取代
+  perturb_xy_m: 0.05
+  perturb_yaw_deg: 5.0
+  threshold: 1.0                        # 27 種都要抓得到才算通過
+
+# 計算量（Thor 輕量設定：和其他程序共用 GPU）
+profile:
+  wb_seeds: 128                         # whole-body IK 種子數（只有一個夾爪位姿，一次呼叫）
+  wb_rounds_max: 4                      # 候選太少時最多再解幾輪（每輪重新抽種子）
+  min_candidates: 15                    # 可停車的候選站位至少要這麼多才開始評分
+  scorer_group: 4                       # 評分：每次 GPU 呼叫評幾個站位（4 × 27 = 108 題）
+  scorer_seeds: 16
+  planner_ik_seeds: 8
+  planner_trajopt_seeds: 1
+  collision_cache_cuboids: 64           # 場景方塊上限；地圖轉出來的方塊太多就加大
+
+# 3D SLAM 地圖 → 障礙方塊（scene_io.py）
+map:
+  voxel_m: 0.04                         # 分群用的體素大小
+  min_voxels: 4                         # 3D 連通塊少於這麼多個體素就當雜訊丟掉
+  roi_radius_m: 1.8                     # 只把夾爪位置周圍這個半徑內的障礙放進 cuRobo（底盤和手臂都到不了更遠；省記憶體）
+  floor_z_m: 0.03                       # 低於此高度的點視為地板（用來判斷已知區域），不當障礙
+  known_band_m: [0.03, 0.60]            # 這個高度範圍內有點的格子也算「已知區域」
+  known_close_cells: 2                  # 地板點之間的小空洞往外補幾格（點雲稀疏時）
+  # 目標物本身不能當障礙。優先用 SLAM 標出的目標區域（request 的 target.mask_key）；
+  # 只給類別時，取該類別在夾爪位置這個半徑內的點（同類別但較遠的物體仍是障礙）：
+  target_object_radius_m: 0.20
+  target_clear_radius_m: 0.07           # 兩者都沒有時的退路：以夾爪位置為中心的直立圓柱（這個半徑、上下各
+  target_clear_half_height_m: 0.10      #   這個高度）內的點不當障礙。直立的小物體（罐子、瓶子）可以；大物體請給遮罩或類別
+  box_xy_margin_m: 0.01                 # 方塊比點雲範圍外擴多少
+  box_z_margin_m: 0.005
+  # 同一個物體內頂面高度差超過這個值就分層、各自包方塊（桌面、擋板、櫃子黏在一起時不會被包成一個最高的大方塊）。
+  # 沒有語意分類（只有點雲）時靠這個把物體分開。
+  level_gap_m: 0.06
+  box_fill: 0.7                         # 一個方塊至少要這麼滿（邊緣參差的物體不會被切碎）
+  box_max_empty_m2: 0.04                # 一個方塊最多蓋住這麼多空地；超過就切開（兩個黏在一起的物體不會被包成一大塊）
+  level_min_cells: 8                    # 一層至少要有一塊這麼多格（voxel_m 見方）相連的區域；零星的邊緣格併到上一層

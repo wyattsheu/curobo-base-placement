@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.STL binary
+*.stl binary
+*.npz binary
