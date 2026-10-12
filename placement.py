@@ -24,7 +24,7 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Cuboid, Scene
 from curobo.types import GoalToolPose, Pose
 
-from robot_model import robot_cfg, in_safety_cone, BASE_JOINTS, ARM_JOINTS
+from robot_model import robot_cfg, in_safety_cone, footprint_xy, BASE_JOINTS, ARM_JOINTS
 from scene_io import base_to_map_pose
 
 
@@ -146,8 +146,7 @@ class BasePlacementPlanner:
         d = np.abs(loc) - self.D[None, None] / 2
         sdf = np.linalg.norm(np.maximum(d, 0), axis=-1) + np.minimum(d.max(-1), 0) - S[:, :, None, 3]
         ok = sdf.min(axis=(1, 2)) > 0
-        L, W = self.cfg["robot"]["kachaka"]["size_m"][:2]
-        fp = np.array([[sx * L / 2, sy * W / 2] for sx in (-1, 0, 1) for sy in (-1, 0, 1)])
+        fp = footprint_xy(self.cfg)
         for n, b in enumerate(bases):
             if ok[n]:
                 R = np.array([[math.cos(b[2]), -math.sin(b[2])], [math.sin(b[2]), math.cos(b[2])]])

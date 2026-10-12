@@ -14,31 +14,38 @@ robot:
   # cuRobo 用的 Robot129 設定（碰撞球、URDF 路徑都在裡面），已隨專案放在 assets/，路徑相對於這個檔案。
   # yml 裡的 urdf_path / asset_root_path 相對於 yml 本身（robot_model.robot_dict 會換成絕對路徑）。
   curobo_yml: assets/robot129.yml
-  tool_frame: pinch_center              # 上游給的「夾爪位姿」指的是這個 frame（robot129.yml 定義）
+  tool_frame: pinch_center              # 上游給的「夾爪位姿」指的是這個 frame
+  # pinch_center 在 gripper_base 前方多遠。實驗室 KachakaPiper 模型用 tool = SE3(0, 0, 0.12)
+  # （mm_system reference/robotics-toolbox-python/.../KachakaPiper.py），上游的夾爪位姿就是這個點。
+  tool_offset_m: 0.12
 
-  # ★ 手臂裝在 Kachaka 上的位置 ← 目前是估計值，量測後改這兩行
-  #   = arm_base 原點在 base 座標中的位置與朝向
-  #   量法：手臂 joint1 轉軸與 Kachaka 頂面的交點 → 到底盤中心的前後(x)、左右(y，左正)距離，
-  #         頂面離地高度(z)；手臂正前方與車頭的夾角(yaw)。
-  arm_mount_xyz: [0.12, 0.0, 0.124]
+  # 座標原點 = kachaka_base_link：兩輪之間的轉軸、地面高度，x 朝車頭（實驗室 kachaka.xacro）。
+  # Kachaka 回報的定位、Navigate_to_pose 的目標都是這一點。
+  # 手臂（Piper base_link）裝在這個座標的哪裡：實驗室 kachaka_piper.urdf.xacro 的 piper_mount_joint，
+  # 也是 mm_actions/motion/piper_kinematic.py 的 PIPER_MOUNT_IN_KACHAKA。手臂架在約 0.43 m 高的支架上。
+  arm_mount_xyz: [0.08, 0.0, 0.525]
   arm_mount_rpy_deg: [0.0, 0.0, 0.0]
 
   # 實機護欄（mm_actions/actions/base_action.py）
   joint1_limit_rad: 0.6                 # J1_LIMIT_RAD
   bearing_limit_rad: 0.52               # SAFE_BEARING_RAD：目標方位須在手臂正面 ±30° 內
 
-  # Kachaka 本體碰撞模型（base 座標）。尺寸取自 Kachaka Pro 規格表，實機請確認型號。
+  # Kachaka 本體碰撞模型（base 座標）。尺寸與位置取自實驗室 kachaka.xacro 的 collision box：
+  # 0.387 × 0.240 × 0.095 m，中心在轉軸前方 4.35 cm、離地 4.75 cm。
   kachaka:
-    size_m: [0.387, 0.240, 0.124]       # 長(x)、寬(y)、高(z)
-    sphere_radius: 0.058
-    sphere_z: 0.073                     # 球心高度；球底離地 1.5 cm，不要讓球貼地（浮點誤差會讓碰撞判定亂跳）
+    size_m: [0.387, 0.240, 0.095]       # 長(x)、寬(y)、高(z)
+    body_center_xy: [0.0435, 0.0]       # 車身中心相對於轉軸（base 原點）
+    sphere_radius: 0.045
+    sphere_z: 0.060                     # 球心高度；球底離地 1.5 cm，不要讓球貼地（浮點誤差會讓碰撞判定亂跳）
     sphere_grid: [5, 2]                 # 沿 x 5 顆、沿 y 2 顆
-    # ★ 機身上其他會撞到的東西（例如右後方的相機桿），每顆球 [x, y, z, r]，base 座標
-    extra_spheres: []
-    #   例：extra_spheres: [[-0.15, -0.09, 0.25, 0.03], [-0.15, -0.09, 0.40, 0.03], [-0.15, -0.09, 0.55, 0.03]]
+    # ★ 機身上其他會撞到的東西，每顆球 [x, y, z, r]，base 座標。
+    #   撐起手臂的支架（車頂 0.095 m 到手臂底座 0.525 m）不在實驗室模型裡，形狀未量測：
+    #   先假設是手臂正下方一根直徑 10 cm 的柱子。右側還有相機桿（base_action.py 註解），位置未知、尚未加入。
+    extra_spheres: [[0.08, 0.0, 0.15, 0.05], [0.08, 0.0, 0.24, 0.05], [0.08, 0.0, 0.33, 0.05], [0.08, 0.0, 0.42, 0.05]]
 
-  # 開車時手臂收起的姿態（6 軸，弧度）。null = 用 robot129.yml 的 default_joint_position
-  stow_arm: null
+  # 開車時手臂收起的姿態（6 軸，弧度）。實驗室 mm_actions 放下／遞交後回到的 home 姿態是全零
+  # （actions/place.py、handover.py 的 home_joint_state）。null = 用 robot129.yml 的 default_joint_position。
+  stow_arm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 search:
   # 虛擬關節的搜尋視窗（相對於目前位置）；再與 SLAM 已知區域取交集
@@ -74,6 +81,7 @@ map:
   # 目標物本身不能當障礙。優先用 SLAM 標出的目標區域（request 的 target.mask_key）；
   # 只給類別時，取該類別在夾爪位置這個半徑內的點（同類別但較遠的物體仍是障礙）：
   target_object_radius_m: 0.20
+  target_grow_m: 0.03                   # 緊貼目標物（3 cm 內、在它的高度範圍內）的點也算目標：分割在物體邊緣一定有誤差
   target_clear_radius_m: 0.07           # 兩者都沒有時的退路：以夾爪位置為中心的直立圓柱（這個半徑、上下各
   target_clear_half_height_m: 0.10      #   這個高度）內的點不當障礙。直立的小物體（罐子、瓶子）可以；大物體請給遮罩或類別
   box_xy_margin_m: 0.01                 # 方塊比點雲範圍外擴多少

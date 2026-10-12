@@ -88,14 +88,61 @@ class PlanningScene:
     known: KnownMask                    # known area
 
 
-def load_request(path):
+def load_request(path, cfg=None):
     """request.json written by upstream:
        {"base_pose_in_map": [x, y, yaw],
         "grasp_pose_in_map": {"position": [x, y, z], "quaternion_wxyz": [w, x, y, z]},
         "target": {"mask_key": "target_mask"}     # npz field (N,) bool: the SLAM's labelled target region   ← preferred
                or {"class": "can"}                # class name (SLAM .json) or semantic id: that class near the grasp point
        }"""
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    req = json.loads(Path(path).read_text(encoding="utf-8"))
+    return normalize_request(req, cfg)
+
+
+def normalize_request(req, cfg=None):
+    """Accept the decided gripper pose either in the map frame (grasp_pose_in_map) or, as mm_actions works, in the
+    Piper base frame of the robot standing at base_pose_in_map (grasp_pose_in_piper_base). The latter is moved to the
+    map frame through the arm mount (config robot.arm_mount_xyz / arm_mount_rpy_deg) — the same transform as
+    piper_kinematic.piper_point_to_kachaka. Everything downstream uses grasp_pose_in_map."""
+    if "grasp_pose_in_map" in req or "grasp_pose_in_piper_base" not in req:
+        return req
+    if cfg is None:
+        raise ValueError("grasp_pose_in_piper_base needs the config (arm mount)")
+    from robot_model import arm_mount
+    g = req["grasp_pose_in_piper_base"]; bx, by, bt = req["base_pose_in_map"]
+    mxyz, mq = arm_mount(cfg)
+    p_k = np.asarray(_qrot(mq, g["position"])) + np.asarray(mxyz)                  # piper base → Kachaka base
+    q_k = _qmul(mq, g["quaternion_wxyz"])
+    xy = base_to_map_xy(np.array([p_k[:2]]), (bx, by, bt))[0]                       # Kachaka base → map
+    q_m = _qmul([math.cos(bt / 2), 0.0, 0.0, math.sin(bt / 2)], q_k)
+    out = dict(req); out["grasp_pose_in_map"] = {"position": [float(xy[0]), float(xy[1]), float(p_k[2])], "quaternion_wxyz": list(map(float, q_m))}
+    return out
+
+
+def _qmul(a, b):
+    w1, x1, y1, z1 = a; w2, x2, y2, z2 = b
+    return [w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2]
+
+
+def _qrot(q, v):
+    w, x, y, z = q; p = _qmul(_qmul(q, [0.0, *v]), [w, -x, -y, -z])
+    return p[1:]
+
+
+def load_class_names(path):
+    """Class-name table next to the map, in any of the formats seen in the lab:
+    {"0": "floor", ...} (flat) · {"segmentation": [{"id": 0, "class": "chair"}, ...]} (SLAM_DOCKER_HANDOFF §4)
+    · {"labels": ["wall", "floor", ...], "instances": [...]} (exported instance table). Returns {id: name}."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    j = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(j, dict) and "segmentation" in j:
+        return {int(e["id"]): e["class"] for e in j["segmentation"]}
+    if isinstance(j, dict) and "labels" in j:
+        return {i: n for i, n in enumerate(j["labels"])}
+    return {int(k): v for k, v in j.items()}
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -187,14 +234,18 @@ def height_levels(top, foot, gap, min_cells):
     return [(float(vals[0]) if k == 0 else float(keep[k - 1][0]) + 1e-6, float(h), s) for k, (h, s) in enumerate(keep)]
 
 
-def objects_to_boxes(P, sem, v, min_vox, xy_margin, z_margin, fill=0.7, level_gap=0.06, level_min_cells=8, max_empty_m2=0.04):
+def objects_to_boxes(P, sem, v, min_vox, xy_margin, z_margin, fill=0.7, level_gap=0.06, level_min_cells=8, max_empty_m2=0.04,
+                     keep_out=None):
     """Points (+ optional semantic ids) → obstacle boxes. Per class, 3D-connected voxel clusters (≥ min_vox voxels) are
     objects; without semantic ids everything is one class, so touching things (a board on a table, a cabinet next to
     it) become ONE object. Each object is therefore also split by height: every footprint cell gets the height of its
     highest point, the cell heights are grouped into levels (height_levels), and the boxes are stacked level by level
     — the cells of level k (and everything taller) get a box from the top of level k-1 up to the top of level k.
     So a table top stays at table height instead of growing to the cabinet's height and swallowing the grasp.
-    Boxes lie on the object's own orientation and take the tight extent of its points (+ margin)."""
+    Boxes lie on the object's own orientation and take the tight extent of its points (+ margin).
+    keep_out = (xy (M, 2), z_bottom): the target's footprint. Filling holes in an object's outline would otherwise
+    close the gap the target's (removed) points leave, e.g. a bottle standing right in front of a box; layers whose
+    top is above z_bottom skip those cells, layers below (the table under the bottle) are kept."""
     from scipy import ndimage
     out = []
     for c in np.unique(sem):
@@ -220,9 +271,17 @@ def objects_to_boxes(P, sem, v, min_vox, xy_margin, z_margin, fill=0.7, level_ga
             near = ndimage.distance_transform_edt(~seen, return_distances=False, return_indices=True)
             top = top[near[0], near[1]]                                         # filled-in cells: nearest seen cell
             levels = height_levels(top, foot, level_gap, level_min_cells)
+            ko = None
+            if keep_out is not None and len(keep_out[0]):                     # the target's footprint, this object's grid
+                kij = np.floor((_rot_xy(keep_out[0], -t) - lo) / v).astype(int)
+                ok = (kij[:, 0] >= 0) & (kij[:, 0] < foot.shape[1]) & (kij[:, 1] >= 0) & (kij[:, 1] < foot.shape[0])
+                if ok.any():
+                    ko = np.zeros(foot.shape, bool); ko[kij[ok, 1], kij[ok, 0]] = True; ko = _dilate(ko, 1)
             z_floor = None
             for k, (h_lo, h_hi, surf) in enumerate(levels):
                 mask = foot & (top >= h_lo - 1e-9)
+                if ko is not None and surf > keep_out[1]:                       # a layer reaching above the target's
+                    mask &= ~ko                                                 # bottom never fills the target's place
                 for a, b in decompose(mask, fill=fill, max_empty=max_empty_m2 / v ** 2):
                     x0, y0 = lo + a[::-1] * v; x1, y1 = lo + (b[::-1] + 1) * v
                     m = (Pr[:, 0] >= x0) & (Pr[:, 0] <= x1) & (Pr[:, 1] >= y0) & (Pr[:, 1] <= y1) & (Pr[:, 2] <= h_hi + 1e-9)
@@ -255,8 +314,21 @@ def boxes_map_to_base(boxes, base_pose_in_map):
 
 
 # ---------------------------------------------------------------------------- the one entry point
+def load_occupancy(yaml_path):
+    """Kachaka's 2D map in ROS map_server form (yaml + png, e.g. the lab export's occupancy_<site>.yaml) → KnownMask
+    of FREE cells (map frame). This is where Kachaka itself can drive; the lab's Stage1 uses the same map."""
+    import yaml
+    from PIL import Image
+    y = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
+    img = np.asarray(Image.open(Path(yaml_path).parent / y["image"]).convert("L"), float)
+    occ = img / 255.0 if y.get("negate", 0) else (255.0 - img) / 255.0
+    free = (occ < y.get("free_thresh", 0.196))[::-1]                         # row 0 = lowest y
+    r = float(y["resolution"]); ox, oy = y["origin"][:2]
+    return free, r, (ox + r / 2, oy + r / 2)
+
+
 def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, target=None, class_names=None,
-                    ignore_classes=("floor",)):
+                    ignore_classes=("floor",), occupancy=None):
     """3D semantic SLAM map + decided grasp → PlanningScene (base frame).
     npz: path or dict with means3D (N, 3) float32 [m, SLAM map frame], semantic_ids (N,) uint8,
          optional logit_opacities (N, 1), optional target mask (N,) bool. The SLAM map frame must be the frame
@@ -265,13 +337,20 @@ def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, t
             {"class": name or id}  → points of that class within target_object_radius_m of the grasp point
             None                   → fallback: points in an upright cylinder around the grasp point (radius
                                      target_clear_radius_m, ± target_clear_half_height_m) — fits an upright object
-    class_names: {id: name} (the .json saved next to the .npz); classes may be given by name or id."""
+    class_names: {id: name} (the .json saved next to the .npz); classes may be given by name or id.
+    occupancy: Kachaka's 2D map (yaml path). If given, the base may only park on its FREE cells; otherwise the area
+               the 3D points have seen is used (the 3D map often has no floor points where nothing stands)."""
     M = cfg["map"]
     data = np.load(npz) if not isinstance(npz, dict) else npz
     P = np.asarray(data["means3D"], np.float64)
     sem = np.asarray(data["semantic_ids"]).reshape(-1).astype(int) if "semantic_ids" in data else np.zeros(len(P), int)
     target = target or {}
-    is_tgt = (np.asarray(data[target["mask_key"]]).reshape(-1).astype(bool) if target.get("mask_key") else np.zeros(len(P), bool))
+    if target.get("mask_key"):
+        is_tgt = np.asarray(data[target["mask_key"]]).reshape(-1).astype(bool)
+    elif target.get("instance_id") is not None:                                 # needs the map's instance_ids
+        is_tgt = np.asarray(data["instance_ids"]).reshape(-1) == int(target["instance_id"])
+    else:
+        is_tgt = np.zeros(len(P), bool)
     if "logit_opacities" in data:                                               # drop nearly transparent splats
         k = np.asarray(data["logit_opacities"]).reshape(-1) > 0.0; P, sem, is_tgt = P[k], sem[k], is_tgt[k]
     by_name = {v: int(k) for k, v in (class_names or {}).items()}
@@ -290,28 +369,47 @@ def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, t
         ij = np.floor((Q[:, :2] - xy0) / v).astype(int); known[ij[:, 1], ij[:, 0]] = True
     known = _dilate(known, M["known_close_cells"])
     org = (xy0[0] + v / 2, xy0[1] + v / 2)
-    L, Wk = cfg["robot"]["kachaka"]["size_m"][:2]
-    fp = base_to_map_xy(np.array([[x, y] for x in np.linspace(-L / 2, L / 2, 9) for y in np.linspace(-Wk / 2, Wk / 2, 7)]), base_pose_in_map)
+    from robot_model import footprint_xy
+    fp = base_to_map_xy(footprint_xy(cfg, 9, 7), base_pose_in_map)
     ij = np.floor((fp - org) / v + 0.5).astype(int); known[ij[:, 1], ij[:, 0]] = True   # (assumes the robot is on the map)
+    known_mask = KnownMask(known, v, org, tuple(base_pose_in_map))
+    if occupancy is not None:
+        free, r, o = load_occupancy(occupancy)
+        ij = np.floor((fp - o) / r + 0.5).astype(int)
+        ok = (ij[:, 0] >= 0) & (ij[:, 0] < free.shape[1]) & (ij[:, 1] >= 0) & (ij[:, 1] < free.shape[0])
+        free = free.copy(); free[ij[ok, 1], ij[ok, 0]] = True                  # where it stands now is drivable
+        known_mask = KnownMask(free, r, o, tuple(base_pose_in_map))
 
     # the target object: the SLAM's labelled region if given, else its class near the grasp point, else a radius
     d = np.linalg.norm(P - g, axis=1)
-    if target.get("mask_key"):
-        how = "slam_mask"
+    if target.get("mask_key") or target.get("instance_id") is not None:
+        how = "slam_mask" if target.get("mask_key") else "instance_id"
     elif target.get("class") is not None:
         is_tgt = (sem == cid(target["class"])) & (d < M["target_object_radius_m"]); how = "class_near_grasp"
     else:
         is_tgt = ((np.linalg.norm(P[:, :2] - g[:2], axis=1) < M["target_clear_radius_m"])
                   & (np.abs(P[:, 2] - g[2]) < M.get("target_clear_half_height_m", 0.10))); how = "radius_fallback"
+    # segmentation is never exact at the target's surface: points hugging the target (within target_grow_m, inside its
+    # height range) are the target too — otherwise a mislabelled rim stays an obstacle right where the fingers go
+    grow = M.get("target_grow_m", 0.0)
+    if grow > 0 and is_tgt.any():
+        from scipy.spatial import cKDTree
+        z0, z1 = np.percentile(P[is_tgt, 2], [2, 98])
+        cand = ~is_tgt & ~low & (P[:, 2] >= z0) & (P[:, 2] <= z1) & (np.linalg.norm(P[:, :2] - g[:2], axis=1) < 0.5)
+        if cand.any():
+            d_t, _ = cKDTree(P[is_tgt]).query(P[cand], distance_upper_bound=grow)
+            is_tgt[np.nonzero(cand)[0][np.isfinite(d_t)]] = True
     # obstacles: everything above the floor within roi_radius_m of the grasp point, except the target and ignored classes
     obst = ~low & ~is_tgt & ~np.isin(sem, ign) & (np.linalg.norm(P[:, :2] - g[:2], axis=1) <= M["roi_radius_m"])
     boxes = objects_to_boxes(P[obst], sem[obst], v, M["min_voxels"], M["box_xy_margin_m"], M["box_z_margin_m"],
-                             fill=M.get("box_fill", 0.7), max_empty_m2=M.get("box_max_empty_m2", 0.04), level_gap=M.get("level_gap_m", 0.06), level_min_cells=M.get("level_min_cells", 8))
+                             fill=M.get("box_fill", 0.7), max_empty_m2=M.get("box_max_empty_m2", 0.04), level_gap=M.get("level_gap_m", 0.06),
+                             level_min_cells=M.get("level_min_cells", 8),
+                             keep_out=(P[is_tgt, :2], float(np.percentile(P[is_tgt, 2], 2))) if is_tgt.any() else None)
     boxes.append({"name": "floor", "center": [org[0] + W * v / 2, org[1] + H * v / 2, -0.025], "dims": [W * v + 2, H * v + 2, 0.05], "yaw": 0.0})
 
     gb = map_to_base_xy(g[None, :2], base_pose_in_map)[0]
     sc = PlanningScene(boxes_map_to_base(boxes, base_pose_in_map), (float(gb[0]), float(gb[1]), float(g[2])),
                        tuple(quat_map_to_base(grasp_quat_map, base_pose_in_map[2])), tuple(base_pose_in_map),
-                       KnownMask(known, v, org, tuple(base_pose_in_map)))
-    sc.target_points = int(is_tgt.sum()); sc.target_source = how
+                       known_mask)
+    sc.target_points = int(is_tgt.sum()); sc.target_source = how; sc.known_source = "occupancy" if occupancy is not None else "slam_points"
     return sc

@@ -70,6 +70,19 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 
 ---
 
+### 1.5 直接接實驗室的系統（Thor 上的格式）
+
+| 實驗室有的東西 | 怎麼給 | 說明 |
+|---|---|---|
+| 匯出的 3D 語意地圖資料夾（`robot_ws/data/lab/<site>/`）| `--lab-map <資料夾>` | 讀 `*_sem_color_fine.npz`（points）、`*_instance_labels.npz`、`*_instance_semantic_table_fine.json`、`alignment_*.yaml`；依 alignment（object_query 同一套公式）轉到 Kachaka 地圖座標並把地板移到 z = 0（`lab_map.py`）|
+| Kachaka 的 2D 地圖 `occupancy_<site>.yaml/png` | 和 `--lab-map` 一起自動讀，或 `--occupancy <yaml>` | 站位只能落在它的 free 格子上（3D 點雲常常沒有地板點）；Stage1 用的也是這張 |
+| object_query 的實例編號 | `"target": {"instance_id": 13}` | 該實例的點就是目標物 |
+| 夾爪位姿在 Piper 基座座標（mm_actions 的慣例）| `"grasp_pose_in_piper_base": {...}` 取代 `grasp_pose_in_map` | 用 `base_pose_in_map` 和安裝位置換到地圖座標（同 `piper_point_to_kachaka`）|
+| 類別表 `{"segmentation": [...]}` 或 `{"labels": [...]}` | 自動判斷 | `scene_io.load_class_names` |
+
+在 803 室 9/30 地圖上的實測（夾爪位姿為手動標註，見 `real_maps/map803_0930/requests/`，不在本專案內）：瓶子 19 成功、穩健度 1.00；
+瓶子 13 成功但穩健度 0.11（夾爪離桌面方塊只剩 3 mm）；瓶子 24 在後排被前排瓶子與紙箱圍住，夾爪本身在任何抓法下都會碰到，無解。
+
 ## 2. 輸出
 
 `run_demo.py` 印出一行 `@@JSON@@{…}`：
@@ -85,6 +98,8 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 | `timing_s`、`memory_mb` | 每一步耗時（秒）與 GPU 記憶體（MB） |
 | `n_boxes`、`boxes_base` | 從點雲算出的障礙方塊（base 座標） |
 | `target_points`、`target_source` | 排除了幾個目標物的點、用哪種方式（`slam_mask` / `class_near_grasp` / `radius_fallback`）|
+| **`at_goal.grasp_pose_in_piper_base`** | 站在 `chosen_map` 時，上游的夾爪位姿在 Piper 基座座標的值 → 可直接給 mm_actions 的 `move_arm_to_pose` |
+| `known_source` | 可停車區域的依據：`occupancy`（Kachaka 2D 地圖）或 `slam_points` |
 | `q_success`、`uniq`、`parked_ok`、`rob`、`tried_plans` | 中間結果（候選站位、停車檢查、評分），除錯與可視化用 |
 
 實機上，Kachaka 到位後應該用**實際到達的位置**重新呼叫一次：`scene_from_slam(…, 到達位置, 同一個夾爪位姿)` ＋只有手臂 6 軸的
@@ -164,7 +179,7 @@ chosen_map → Navigate_to_pose；arm.traj → 到位後的手臂
 | 手臂裝在 Kachaka 的位置 | `robot.arm_mount_xyz`、`arm_mount_rpy_deg` | `robot_model.py:82`（運動鏈）、`:124`（護欄）|
 | Kachaka 實際尺寸 | `robot.kachaka.size_m` | 碰撞球、停車檢查 |
 | 相機桿等凸出物 | `robot.kachaka.extra_spheres` | 碰撞球 |
-| 開車時手臂收起的姿態 | `robot.stow_arm`（null = robot129.yml 預設，夾爪在車頭前約 0.5 m）| 停車檢查、手臂規劃起點 |
+| 開車時手臂收起的姿態 | `robot.stow_arm`（目前用實驗室 mm_actions 的 home 姿態：全零）| 停車檢查、手臂規劃起點 |
 | Kachaka 到位誤差 | `robustness.perturb_xy_m`、`perturb_yaw_deg` | 27 種擾動 |
 | 夾爪位姿指的 frame | `robot.tool_frame` | 必須和上游給位姿時用的 frame 一致 |
 | 點雲轉方塊 | `map.*`（體素、分層、方塊填滿率、目標物半徑） | `scene_io.py` |
@@ -173,7 +188,9 @@ chosen_map → Navigate_to_pose；arm.traj → 到位後的手臂
 
 ## 7. 已知限制
 
-- 手臂安裝偏移 (0.12, 0, 0.124)、Kachaka 尺寸、到位誤差 ±5 cm／±5° 是假設值（config 裡標了 ★）。
+- 手臂安裝位置 (0.08, 0, 0.525)、Kachaka 車身（0.387 × 0.240 × 0.095 m，中心在轉軸前 4.35 cm）、工具點（gripper_base 前 0.12 m）
+  取自實驗室的 `kachaka_piper.urdf.xacro` 與 mm_actions；**撐起手臂的支架形狀未量測**（先用一根柱子近似，config 標 ★），
+  右側相機桿尚未加入；到位誤差 ±5 cm／±5° 是假設值。
 - 需確認：SLAM 與 Kachaka 用同一張地圖座標、地板在 z ≈ 0；上游夾爪位姿用的 frame 是 `pinch_center`。
 - 點雲轉出的方塊比實物大約 1–2 cm（含安全餘量）；桌下等懸空空間會被當成實心。
 - 穩健度用 16 個 IK 種子評分，每次執行會有跳動（同一站位 0.85–0.96），常常走「用最穩健的」退路；可調 `profile.scorer_seeds` 或 `robustness.threshold`。

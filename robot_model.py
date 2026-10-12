@@ -45,7 +45,8 @@ def kachaka_spheres(cfg):
     """Collision spheres of the Kachaka body (+ extra_spheres), in the base frame."""
     k = cfg["robot"]["kachaka"]
     L, W, _ = k["size_m"]; r, z = k["sphere_radius"], k["sphere_z"]; nx, ny = k["sphere_grid"]
-    xs = np.linspace(-L / 2 + r, L / 2 - r, nx); ys = np.linspace(-W / 2 + r, W / 2 - r, ny)
+    cx, cy = k.get("body_center_xy", [0.0, 0.0])                    # body centre relative to the turning axis
+    xs = cx + np.linspace(-L / 2 + r, L / 2 - r, nx); ys = cy + np.linspace(-W / 2 + r, W / 2 - r, ny)
     out = [{"center": [float(x), float(y), z], "radius": r} for x in xs for y in ys]
     out += [{"center": [float(a), float(b), float(c)], "radius": float(rr)} for a, b, c, rr in (k.get("extra_spheres") or [])]
     return out
@@ -64,6 +65,9 @@ def robot_dict(cfg, window=None):
     yml = curobo_yml_path(cfg)
     d = yaml.safe_load(yml.read_text(encoding="utf-8"))
     k, cs = d["kinematics"], d["kinematics"]["cspace"]
+    tool = (k.get("extra_links") or {}).get(R["tool_frame"])
+    if tool is not None and R.get("tool_offset_m") is not None:     # where the decided gripper pose sits on the gripper
+        tool["fixed_transform"][2] = float(R["tool_offset_m"])
     for key in ("urdf_path", "asset_root_path"):              # relative to the yml → absolute (cuRobo would resolve
         if k.get(key) and not Path(k[key]).is_absolute():     # a relative path against its own content folder)
             k[key] = str((yml.parent / k[key]).resolve())
@@ -128,3 +132,9 @@ def in_safety_cone(cfg, b, target_xy):
     arm_yaw = b[:, 2] + math.radians(cfg["robot"]["arm_mount_rpy_deg"][2])
     a = np.arctan2(target_xy[1] - my, target_xy[0] - mx) - arm_yaw
     return np.abs((a + np.pi) % (2 * np.pi) - np.pi) <= cfg["robot"]["bearing_limit_rad"]
+
+
+def footprint_xy(cfg, nx=3, ny=3):
+    """Sample points of the Kachaka body outline in the base frame (body centre is ahead of the turning axis)."""
+    k = cfg["robot"]["kachaka"]; L, W = k["size_m"][:2]; cx, cy = k.get("body_center_xy", [0.0, 0.0])
+    return np.array([[cx + x, cy + y] for x in np.linspace(-L / 2, L / 2, nx) for y in np.linspace(-W / 2, W / 2, ny)])
