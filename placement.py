@@ -24,7 +24,7 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Cuboid, Scene
 from curobo.types import GoalToolPose, Pose
 
-from robot_model import robot_cfg, in_safety_cone, footprint_xy, n_collision_spheres, BASE_JOINTS, ARM_JOINTS
+from robot_model import robot_cfg, in_safety_cone, footprint_xy, kachaka_spheres, n_collision_spheres, BASE_JOINTS, ARM_JOINTS
 
 MPPI_PARTICLES = 25          # particles per seed in cuRobo v2's IK MPPI stage (sets the kernel size above)
 from scene_io import base_to_map_pose
@@ -80,10 +80,7 @@ class BasePlacementPlanner:
                      collision_cache=cache, use_cuda_graph=False,
                      num_ik_seeds=P["planner_ik_seeds"], num_trajopt_seeds=P["planner_trajopt_seeds"]))
         self.planner.warmup(enable_graph=True, num_warmup_iterations=1)
-        # 2. batched forward kinematics for the parking check (only get_kinematics is used: validate() is broken in this release)
-        from curobo.collision_checking import RobotCollisionChecker, RobotCollisionCheckerCfg
-        self.fk = RobotCollisionChecker(RobotCollisionCheckerCfg.load_from_config(robot_config=rc_wb, scene_model=self.scene_at((0, 0, 0)),
-                  n_cuboids=cache["cuboid"], n_meshes=0, collision_activation_distance=0.0))
+        self.base_sph = np.array([[*k['center'], k['radius']] for k in kachaka_spheres(cfg)])   # 2. parking check: the base only
         st = self.planner.default_joint_state
         stow = cfg["robot"].get("stow_arm")
         self.stow = np.array(stow if stow else [float(st.position.reshape(-1)[list(st.joint_names).index(j)]) for j in ARM_JOINTS])
@@ -142,13 +139,13 @@ class BasePlacementPlanner:
 
     # ------------------------------------------------------------ step 2
     def parking_ok(self, bases):
-        """Kachaka + stowed arm parked at each pose: collision-free, and all of the footprint on known cells.
-        cuRobo gives every collision sphere (batched FK); the scene is boxes, so the distance is exact."""
+        """Kachaka parked at each pose: its base spheres clear of every box, and its footprint on drivable cells.
+        Only the base counts here (where it can go); the arm and anything above the base are checked by the arm planner."""
         bases = np.atleast_2d(bases)[:, :3]
-        q = np.c_[bases, np.tile(self.stow, (len(bases), 1))]
-        kin = self.fk.get_kinematics(torch.tensor(q, device="cuda", dtype=torch.float32)[:, None, :])
-        sph = kin.robot_spheres.reshape(len(q), -1, 4).cpu().numpy()
-        S = sph[:, sph[0, :, 3] > 0]                                         # [n, spheres, 4]
+        c0, s0 = np.cos(bases[:, 2])[:, None], np.sin(bases[:, 2])[:, None]
+        Sx = bases[:, :1] + c0 * self.base_sph[None, :, 0] - s0 * self.base_sph[None, :, 1]
+        Sy = bases[:, 1:2] + s0 * self.base_sph[None, :, 0] + c0 * self.base_sph[None, :, 1]
+        S = np.stack([Sx, Sy, np.broadcast_to(self.base_sph[None, :, 2], Sx.shape), np.broadcast_to(self.base_sph[None, :, 3], Sx.shape)], -1)
         p = S[:, :, None, :3] - self.C[None, None]                           # → each box frame (rotate by -yaw)
         c, s = np.cos(-self.Y)[None, None], np.sin(-self.Y)[None, None]
         loc = np.stack([c * p[..., 0] - s * p[..., 1], s * p[..., 0] + c * p[..., 1], p[..., 2]], -1)

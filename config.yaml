@@ -30,17 +30,16 @@ robot:
   joint1_limit_rad: 0.6                 # J1_LIMIT_RAD
   bearing_limit_rad: 0.52               # SAFE_BEARING_RAD：目標方位須在手臂正面 ±30° 內
 
-  # Kachaka 本體碰撞模型（base 座標）。底面取自實驗室 kachaka.xacro 的 collision box（0.387 × 0.240 m，中心在轉軸前
-  # 4.35 cm）；車身本體高 0.095 m，上面撐起手臂的支架是同樣大小的長方體，一路到手臂底座（0.525 m），所以整個當成
-  # 一個 0.387 × 0.240 × 0.525 m 的長方體，用一層層的碰撞球包住。
+  # Kachaka 底盤碰撞模型（base 座標），取自實驗室 kachaka.xacro 的 collision box：0.387 × 0.240 × 0.095 m，中心在轉軸前 4.35 cm。
+  # 只建底盤：停車檢查只問「底盤能不能停在那裡」（加上 Kachaka 2D 地圖的可行駛區域）；底盤上方的支架不另外建，
+  # 碰撞只在規劃手臂時檢查（手臂的碰撞球在 robot129.yml）。
   kachaka:
-    size_m: [0.387, 0.240, 0.525]       # 長(x)、寬(y)、高(z)：車身 + 支架，到手臂底座為止
+    size_m: [0.387, 0.240, 0.095]       # 長(x)、寬(y)、高(z)
     body_center_xy: [0.0435, 0.0]       # 車身中心相對於轉軸（base 原點）
-    sphere_radius: 0.06
-    sphere_z: 0.075                     # 最底層球心高度；球底離地 1.5 cm，不要讓球貼地（浮點誤差會讓碰撞判定亂跳）
-    sphere_grid: [5, 3]                 # 每層沿 x 5 顆、沿 y 3 顆的外圈（間距小於直徑，中間沒有縫）
-    # ★ 機身上其他會撞到的東西，每顆球 [x, y, z, r]，base 座標。右側的相機桿（base_action.py 註解）位置未知、尚未加入。
-    extra_spheres: []
+    sphere_radius: 0.045
+    sphere_z: 0.060                     # 球心高度；球底離地 1.5 cm，不要讓球貼地（浮點誤差會讓碰撞判定亂跳）
+    sphere_grid: [5, 2]                 # 沿 x 5 顆、沿 y 2 顆
+    extra_spheres: []                   # ★ 機身上其他會撞到的東西，每顆球 [x, y, z, r]，base 座標
 
   # 開車時手臂收起的姿態（6 軸，弧度），也是到位後手臂軌跡的起點。用實驗室 mm_actions 夾到東西後的收起姿態
   # （actions/grasp.py 的 home_joint_state），夾爪在車頭前 0.22 m、離地 0.81 m。
