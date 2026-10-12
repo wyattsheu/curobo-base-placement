@@ -42,12 +42,17 @@ def quat_from_rpy(r, p, y):
 
 
 def kachaka_spheres(cfg):
-    """Collision spheres of the Kachaka body (+ extra_spheres), in the base frame."""
+    """Collision spheres of the Kachaka body (+ extra_spheres), in the base frame. The body is a box of size_m
+    (it goes all the way up to the arm base); it is covered by layers of spheres from sphere_z up to the top, each
+    layer only on the outline of the sphere_grid (the inside is enclosed by the outline anyway)."""
     k = cfg["robot"]["kachaka"]
-    L, W, _ = k["size_m"]; r, z = k["sphere_radius"], k["sphere_z"]; nx, ny = k["sphere_grid"]
+    L, W, H = k["size_m"]; r, z0 = k["sphere_radius"], k["sphere_z"]; nx, ny = k["sphere_grid"]
     cx, cy = k.get("body_center_xy", [0.0, 0.0])                    # body centre relative to the turning axis
     xs = cx + np.linspace(-L / 2 + r, L / 2 - r, nx); ys = cy + np.linspace(-W / 2 + r, W / 2 - r, ny)
-    out = [{"center": [float(x), float(y), z], "radius": r} for x in xs for y in ys]
+    top = max(z0, H - r)                                            # top layer flush with the top of the box
+    zs = np.linspace(z0, top, max(1, int(np.ceil((top - z0) / (1.4 * r))) + 1))
+    ring = [(x, y) for i, x in enumerate(xs) for j, y in enumerate(ys) if i in (0, nx - 1) or j in (0, ny - 1)]
+    out = [{"center": [float(x), float(y), float(z)], "radius": r} for z in zs for x, y in ring]
     out += [{"center": [float(a), float(b), float(c)], "radius": float(rr)} for a, b, c, rr in (k.get("extra_spheres") or [])]
     return out
 
