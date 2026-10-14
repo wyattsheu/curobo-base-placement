@@ -262,11 +262,18 @@ def objects_to_boxes(P, sem, v, min_vox, xy_margin, z_margin, fill=0.7, level_ga
         counts = np.bincount(lab.ravel(), minlength=n + 1)
         jobs += [(c, obj, Pc[pl == obj]) for obj in range(1, n + 1) if counts[obj] >= min_vox]   # fewer: noise
     args = (v, xy_margin, z_margin, fill, level_gap, level_min_cells, max_empty_m2, keep_out)
+    results = None
     if workers > 1 and len(jobs) > 1:                                           # biggest objects first, results in order
-        pool = _box_pool(workers)
-        futs = {k: pool.submit(_object_boxes, jobs[k][2], *args) for k in sorted(range(len(jobs)), key=lambda k: -len(jobs[k][2]))}
-        results = [futs[k].result() for k in range(len(jobs))]
-    else:
+        from concurrent.futures.process import BrokenProcessPool
+        try:
+            pool = _box_pool(workers)
+            futs = {k: pool.submit(_object_boxes, jobs[k][2], *args) for k in sorted(range(len(jobs)), key=lambda k: -len(jobs[k][2]))}
+            results = [futs[k].result() for k in range(len(jobs))]
+        except BrokenProcessPool:        # e.g. the calling script has no `if __name__ == "__main__":` guard (spawn)
+            import warnings
+            warnings.warn("box fitting pool failed; boxing serially (guard the calling script with __main__)")
+            _POOLS.pop(workers, None)
+    if results is None:
         results = [_object_boxes(Po, *args) for _, _, Po in jobs]
     out = []
     for (c, obj, _), boxes in zip(jobs, results):
