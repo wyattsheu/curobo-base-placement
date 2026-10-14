@@ -207,7 +207,8 @@ class BasePlacementPlanner:
         return int(cone.sum()), cand[u], park
 
     def plan(self):
-        P, th = self.cfg["profile"], self.cfg["robustness"]["threshold"]
+        P, Rb = self.cfg["profile"], self.cfg["robustness"]
+        th, floor = Rb["threshold"], Rb.get("min_accept", 0.0)
         for k in ("wholebody_ik_s", "filter_s", "scoring_s", "arm_plan_s"):
             self.T[k] = 0.0
         # 1.+2. whole-body IK (fresh seeds each round) until enough parkable candidates
@@ -236,14 +237,32 @@ class BasePlacementPlanner:
                 break
         below = False
         if best is None:                     # nobody reached the threshold: try the most robust ones, and say so
+            done = {t["idx"] for t in tried}
             for j in sorted(checked, key=lambda j: (-checked[j], dist[j])):
-                if checked[j] <= 0:
+                if checked[j] <= 0 or checked[j] < floor - 1e-9:
                     break
+                if j in done:
+                    continue
                 arm = self._timed("arm_plan_s", self.plan_arm, tuple(U[j, :3]))
                 tried.append({"idx": j, "ok": arm is not None, "robustness": checked[j]})
                 if arm is not None:
                     best, below = j, True; break
-        res = {"ok": best is not None, "below_threshold": below, "robustness": checked.get(best) if best is not None else None,
+        # why there is no answer, at the first step that ran out of candidates
+        if best is not None:
+            reason = "ok"
+        elif len(Q) == 0:
+            reason = "no_ik_solution"        # no 9-DoF IK solution anywhere in the search window
+        elif n_cone == 0:
+            reason = "outside_cone"          # solutions exist, but none keeps the target in the arm's ±30° safety cone
+        elif not park.any():
+            reason = "cannot_park"           # the base collides or leaves the drivable area at every candidate
+        elif not tried:
+            reason = "not_robust"            # parkable, but every candidate scores below min_accept
+        else:
+            reason = "arm_plan_failed"       # robust enough, but no arm trajectory from the stowed pose
+        res = {"ok": best is not None, "reason": reason, "below_threshold": below,
+               "robustness": checked.get(best) if best is not None else None,
+               "max_robustness": max(checked.values()) if checked else None,
                "n_success": int(len(Q)), "wb_rounds": rounds, "n_cone": n_cone, "window": self.window,
                "q_success": Q.tolist(), "uniq": U.tolist(), "parked_ok": park.tolist(),
                "rob": [checked.get(i) for i in range(len(U))], "n_checked": len(checked), "tried_plans": tried}

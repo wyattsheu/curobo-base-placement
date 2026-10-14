@@ -60,13 +60,15 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 俯視圖每一格取它自己的頂面高度，頂面高度不同的區域（桌面 0.41 m、擋板 0.71 m、櫃子 0.91 m）各自包方塊、往上堆疊，
 不會把整片桌面包到櫃子的高度（`scene_io.py:169 height_levels`）。
 
-在測試場景驗證過（RTX PRO 6000）：
+在測試場景驗證過（RTX PRO 6000，2026-10-14）：
 
-| 輸入 | 障礙方塊 | IK 解 | 選中站位 (map) | 軌跡對照有語意的方塊 |
-|---|---|---|---|---|
-| 點雲＋語意＋目標遮罩 | 10 | 56 | (3.19, 0.86, 117°) | 最小間隙 4.4 mm |
-| 點雲＋目標遮罩 | 16 | 56 | 同上 | 4.4 mm |
-| 只有點雲（不給目標） | 16 | 56 | 同上 | 4.4 mm |
+| 輸入 | 障礙方塊 | 目標物判定 | IK 解 | 選中站位 (map) | 穩健度 |
+|---|---|---|---|---|---|
+| 點雲＋語意＋目標遮罩 | 12 | `slam_mask` | 43 | (3.16, 0.89, 137°) | 0.63 |
+| 點雲＋目標遮罩 | 18 | `slam_mask` | 41 | 同上 | 0.67 |
+| 只有點雲（不給目標） | 24 | `radius_fallback` | 41 | 同上 | 0.67 |
+
+三種輸入選到同一個站位。穩健度都沒到 1.0，是走「用最穩健的」退路選出來的（見 2.2）。
 
 ---
 
@@ -81,33 +83,98 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 | 類別表 `{"segmentation": [...]}` 或 `{"labels": [...]}` | 自動判斷 | `scene_io.load_class_names` |
 
 在 803 室 9/30 地圖上的實測（夾爪位姿為手動標註，見 `real_maps/map803_0930/requests/`，不在本專案內）：瓶子 19 成功、穩健度 1.00；
-瓶子 13 成功但穩健度 0.11（夾爪離桌面方塊只剩 3 mm）；瓶子 24 在後排被前排瓶子與紙箱圍住，夾爪本身在任何抓法下都會碰到，無解。
+瓶子 13 成功但穩健度 0.11（夾爪離桌面方塊只剩 3 mm；加了 `min_accept: 0.5` 之後會改回 `not_robust`，尚未重跑）；瓶子 24 在後排被前排瓶子與紙箱圍住，夾爪本身在任何抓法下都會碰到，無解。
 
 ## 2. 輸出
 
-`run_demo.py` 印出一行 `@@JSON@@{…}`：
+`run_demo.py` 印出一行 `@@JSON@@{…}`。上游只要先看 `ok` 和 `reason`。
+
+### 2.1 欄位
 
 | 欄位 | 意義 |
 |---|---|
-| `ok` | 找到站位，而且停過去後手臂規劃成功 |
-| **`chosen_map`** | **(x, y, yaw) 地圖座標 → 直接給 Kachaka `Navigate_to_pose`** |
+| **`ok`** | true = 找到站位，而且停過去後手臂規劃成功 |
+| **`reason`** | `ok`，或沒有結果時卡在哪一步（見 2.3） |
+| **`chosen_map`** | **(x, y, yaw) 地圖座標 → 直接給 Kachaka `Navigate_to_pose`**（只有 `ok` 時才有） |
 | `chosen_base` | 同一個站位，相對於現在位置（base 座標）的移動量 |
 | **`arm.traj`、`arm.dt`** | 停好後，手臂從收起姿態到夾爪位姿的軌跡：N × 6（joint1–6，弧度），每步 `dt` 秒 |
-| `robustness` | 假設 Kachaka 停歪 ±5 cm、±5°（27 種），手臂還抓得到的比例 |
-| `below_threshold` | true = 沒有站位 27 種全過，改用最穩健的那個 |
+| **`at_goal.grasp_pose_in_piper_base`** | 站在 `chosen_map` 時，上游的夾爪位姿在 Piper 基座座標的值 → 可直接給 mm_actions 的 `move_arm_to_pose` |
+| `robustness` | 選中站位的穩健度：假設 Kachaka 停歪 ±5 cm、±5°（27 種），手臂還抓得到的比例 |
+| `below_threshold` | true = 沒有站位達到 `threshold`，選中的是退路（見 2.2） |
+| `max_robustness` | 評過分的站位中最高的穩健度（`not_robust` 時看差多少） |
 | `timing_s`、`memory_mb` | 每一步耗時（秒）與 GPU 記憶體（MB） |
 | `n_boxes`、`boxes_base` | 從點雲算出的障礙方塊（base 座標） |
 | `target_points`、`target_source` | 排除了幾個目標物的點、用哪種方式（`slam_mask` / `class_near_grasp` / `radius_fallback`）|
-| **`at_goal.grasp_pose_in_piper_base`** | 站在 `chosen_map` 時，上游的夾爪位姿在 Piper 基座座標的值 → 可直接給 mm_actions 的 `move_arm_to_pose` |
 | `known_source` | 可停車區域的依據：`occupancy`（Kachaka 2D 地圖）或 `slam_points` |
-| `q_success`、`uniq`、`parked_ok`、`rob`、`tried_plans` | 中間結果（候選站位、停車檢查、評分），除錯與可視化用 |
+| `n_success`、`n_cone`、`parked_ok`、`n_checked` | 每一步剩下多少候選：IK 解數、護欄內的解數、每個候選能不能停、評過分的站位數 |
+| `q_success`、`uniq`、`rob`、`tried_plans` | 中間結果（候選站位、評分、試過的手臂規劃），除錯與可視化用 |
+
+### 2.2 穩健度門檻：`threshold` 和 `min_accept`（`config.yaml` 的 `robustness`）
+
+1. 由近到遠評分，第一個穩健度 ≥ `threshold`（預設 1.0，27 種全過）而且手臂規劃成功的站位就採用。
+2. 沒有站位達到 `threshold` 時，把評過分的站位依穩健度由高到低排，只試 ≥ `min_accept`（預設 0.5）的，
+   第一個手臂規劃成功的就採用，`below_threshold = true`。
+3. 都沒有就 `ok = false`、`reason = not_robust`，不會把只有一兩種擾動抓得到的站位當成功回傳。
+
+所以不需要手動把 `threshold` 降到 0.9：退路會自動拿到這個場景最高的分數，`min_accept` 決定最低能接受多少。
+
+### 2.3 `reason`：沒有結果時卡在哪一步
+
+程式每一步都有上限（IK 最多 `wb_rounds_max` 輪、只評有限個候選、退路只試 ≥ `min_accept` 的），不會一直算下去。
+`reason` 是**第一個把候選篩光的步驟**：
+
+| reason | 意思 | 上游可以怎麼做 |
+|---|---|---|
+| `ok` | 找到站位 | 導航到 `chosen_map` |
+| `no_ik_solution` | 搜尋範圍內沒有任何 9 軸 IK 解：搆不到，或夾爪位姿本身就碰撞 | 換抓法 |
+| `outside_cone` | 有解，但都超出 ±30° 護欄（`robot.bearing_limit_rad`） | 換抓法，或放寬護欄 |
+| `cannot_park` | 有解，但底盤停的位置都不在可行駛區域（Kachaka 2D 地圖或 SLAM 看過的地板） | 檢查地圖，或換抓法 |
+| `not_robust` | 停得進去，但穩健度都低於 `min_accept`；看 `max_robustness` 差多少 | 冒險降 `min_accept`，或換抓法 |
+| `arm_plan_failed` | 夠穩，但手臂從收起姿態規劃不出軌跡 | 檢查 `robot.stow_arm`，或重試 |
+
+注意：
+- `no_ik_solution` 是取樣沒找到（128 種子 × 最多 4 輪），不是證明無解；解空間很窄時可能漏掉。
+  「夾爪本身碰撞」目前也歸在這裡，還沒有分開判斷。
+- 底盤的碰撞球在 9 軸 IK 裡就已經檢查過（`robot_model.py:92`），所以地上有障礙物時通常是 `no_ik_solution`；
+  `cannot_park` 實際上只會來自可行駛區域的檢查。
+
+每一種 reason 都用場景驗證過，見第 8 節。
+
+### 2.4 到位後
 
 實機上，Kachaka 到位後應該用**實際到達的位置**重新呼叫一次：`scene_from_slam(…, 到達位置, 同一個夾爪位姿)` ＋只有手臂 6 軸的
-MotionPlanner（`robot_cfg(cfg, lock_base=True)`）。`placement.py:178 plan_arm` 就是這個流程。
+MotionPlanner（`robot_cfg(cfg, lock_base=True)`）。`placement.py:183 plan_arm` 就是這個流程。
 
 ---
 
 ## 3. 怎麼跑
+
+### 建構環境（x86_64 + NVIDIA GPU，第一次）
+
+用 [uv](https://docs.astral.sh/uv/) 建一個 Python 3.12 的虛擬環境。以下步驟在 RTX PRO 6000（CUDA 12.8 驅動）上從零跑過：
+
+```bash
+uv venv --python 3.12 ~/env_curobo
+source ~/env_curobo/bin/activate
+
+# 1. PyTorch（CUDA 12.8 版）
+uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+
+# 2. cuRobo v2，固定在這個專案測過的 commit
+git clone https://github.com/NVlabs/curobo.git
+git -C curobo checkout 4ea7736
+uv pip install "./curobo[cu12]"
+
+# 3. 這個專案自己的相依
+uv pip install -r requirements.txt
+
+# 檢查：應印出 0.8.0 2.11.0+cu128 True
+python -c "import curobo, torch; print(curobo.__version__, torch.__version__, torch.cuda.is_available())"
+```
+
+- 驅動是 CUDA 13 的話，第 1 步換成 cu13 的 PyTorch，第 2 步用 `"./curobo[cu13]"`（見 cuRobo 的 `docs/getting-started/installation.rst`）。
+- Jetson Thor（aarch64）要用 NVIDIA 給 Jetson 的 PyTorch，不能直接照上面裝；cuRobo 部分相同。
+- 第一次執行會編譯 warp kernel，比之後慢。
 
 ### 有 cuRobo + GPU 的機器（Thor、工作站）
 
@@ -162,7 +229,7 @@ PlanningScene（base 座標 = Kachaka 現在的位置）
    │   1 :132 whole_body()   9 軸 IK：同一個夾爪位姿 → 很多候選站位 (x, y, ψ)
    │   2 :201 _candidates()  ±30° 護欄（robot_model.py:133）＋ :141 parking_ok() 底盤不撞、在可行駛區域
    │   3 :163 robustness()   由近到遠，27 種到位誤差各重解 6 軸 IK
-   │   4 :183 plan_arm()     底盤鎖住，從收起姿態做 6 軸 MotionPlanner；失敗就換下一個（:238 都沒達標時用最穩健的）
+   │   4 :183 plan_arm()     底盤鎖住，從收起姿態做 6 軸 MotionPlanner；失敗就換下一個（:239 都沒達標時用最穩健的，但不低於 min_accept；:250 reason）
    ▼
 chosen_map → Navigate_to_pose；arm.traj、at_goal.grasp_pose_in_piper_base → 到位後的手臂
 ```
@@ -194,6 +261,29 @@ chosen_map → Navigate_to_pose；arm.traj、at_goal.grasp_pose_in_piper_base �
 - 收起姿態用 mm_actions 夾到東西後的姿態；空手的 home（全零）完全折疊，robot129 的碰撞球在那裡重疊，cuRobo 會拒絕當起點。
 - 需確認：SLAM 與 Kachaka 用同一張地圖座標、地板在 z ≈ 0；上游夾爪位姿用的 frame 是 `pinch_center`。
 - 點雲轉出的方塊比實物大約 1–2 cm（含安全餘量）；桌下等懸空空間會被當成實心。
-- 穩健度用 16 個 IK 種子評分，每次執行會有跳動（同一站位 0.85–0.96），常常走「用最穩健的」退路；可調 `profile.scorer_seeds` 或 `robustness.threshold`。
+- 穩健度用 16 個 IK 種子評分，每次執行會有跳動（測試場景同一站位 0.59–0.67），測試場景走的是「用最穩健的」退路；可調 `profile.scorer_seeds`、`robustness.threshold` 或 `robustness.min_accept`。
 - 停車檢查只用底盤的 10 顆球，直接用 numpy 算到方塊的距離（`placement.py:141`）；cuRobo v2 這個版本的 `collision_checking.validate()` 有 bug，沒有使用。
 - 時間只在 RTX PRO 6000 上量過（solver 建立約 9 s 一次性；找站位到手臂規劃約 1.5 s；GPU 峰值約 0.7 GB），Thor 上需要實測。
+
+## 8. 驗證場景
+
+把測試場景（`test_maps/`）改掉一個條件，確認每一種 `reason` 都在該出現的地方出現。
+改動只在記憶體裡做（改 config 的值、移動夾爪位姿、把可行駛區域挖掉），測試程式不在這個 repo 裡。
+
+結果（RTX PRO 6000，2026-10-14，8/8 通過）：
+
+| 場景 | 改了什麼 | reason | IK 解 | 護欄內 | 可停 | 穩健度（選中 / 最高） | 手臂規劃次數 |
+|---|---|---|---|---|---|---|---|
+| `baseline` | 不改 | `ok`（退路） | 43 | 33 | 30 | 0.59 / 0.59 | 1 |
+| `loose_threshold` | `threshold` 降到 0.5 | `ok`（直接達標） | 43 | 33 | 30 | 0.52 / 0.52 | 1 |
+| `unreachable` | 夾爪位姿抬到離地 2.0 m | `no_ik_solution` | 0 | 0 | 0 | – | 0 |
+| `gripper_in_cabinet` | 夾爪位姿放進櫃子裡（夾爪本身一定碰撞） | `no_ik_solution` | 0 | 0 | 0 | – | 0 |
+| `cone_closed` | 護欄收到 ±0°（強制觸發這個分支） | `outside_cone` | 181 | 0 | 0 | – | 0 |
+| `no_drivable_area` | 目標 1.2 m 內都標成不可行駛 | `cannot_park` | 181 | 123 | 0 | – | 0 |
+| `sloppy_navigation` | 到位誤差假設成 ±15 cm、±15° | `not_robust` | 43 | 33 | 30 | – / 0.26 | 0 |
+| `bad_stow` | 收起姿態設成全零（碰撞球自我重疊） | `arm_plan_failed` | 43 | 33 | 30 | – / 0.59 | 7 |
+
+- `loose_threshold` 評了 4 個站位就停（由近到遠，第一組就有達標的），其他場景評完全部 30 個。
+- IK 解 181 的兩個場景：可停的候選一直不到 `min_candidates`（15 個），所以 IK 跑滿 `wb_rounds_max`（4 輪）才停。
+- `bad_stow` 會印出 cuRobo 的 `Start or End state in collision`，是預期的。
+- 穩健度每次執行會跳動，數字可能和上表差一點，但 reason 應該一樣。

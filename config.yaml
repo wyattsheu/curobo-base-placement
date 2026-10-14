@@ -58,6 +58,7 @@ robustness:
   perturb_xy_m: 0.05
   perturb_yaw_deg: 5.0
   threshold: 1.0                        # 27 種都要抓得到才算通過
+  min_accept: 0.5                       # 沒有站位達到 threshold 時，退路只接受穩健度 ≥ 這個值的站位；都不到就回報無解（reason = not_robust）
 
 # 計算量（Thor 輕量設定：和其他程序共用 GPU）
 profile:
