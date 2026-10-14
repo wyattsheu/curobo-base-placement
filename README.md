@@ -212,6 +212,7 @@ curobo_base_placement/
 ├─ bundle.py          ← 打包成一支腳本丟到 server 跑
 ├─ make_test_maps.py  ← 從 test_scene.yaml 做出測試用的點雲與請求
 ├─ test_scene.yaml、test_maps/   ← 測試場景（桌上罐子前有擋板、左邊櫃子、後方與右方是牆）
+├─ validation/       ← 驗證與效能測試（獨立資料夾，主程式不引用；見第 8 節與 validation/README.md）
 └─ assets/            ← robot129.yml（cuRobo 設定、碰撞球）、robot129_description/（URDF、STL）
 ```
 
@@ -267,8 +268,15 @@ chosen_map → Navigate_to_pose；arm.traj、at_goal.grasp_pose_in_piper_base �
 
 ## 8. 驗證場景
 
-把測試場景（`test_maps/`）改掉一個條件，確認每一種 `reason` 都在該出現的地方出現。
-改動只在記憶體裡做（改 config 的值、移動夾爪位姿、把可行駛區域挖掉），測試程式不在這個 repo 裡。
+把測試場景（`test_maps/`）改掉一個條件，確認每一種 `reason` 都在該出現的地方出現：
+
+```bash
+python validation/run_scenarios.py                    # 全部場景，每個印 PASS / FAIL
+python validation/run_scenarios.py no_drivable_area   # 只跑指定的
+```
+
+`validation/` 是獨立的測試資料夾：主程式不引用它，改動只在記憶體裡做（改 config 的值、移動夾爪位姿、把可行駛區域挖掉），
+不改 `config.yaml` 或 `test_maps/`。不用的話可以整個忽略。各程式的說明見 `validation/README.md`。
 
 結果（RTX PRO 6000，2026-10-14，8/8 通過）：
 
