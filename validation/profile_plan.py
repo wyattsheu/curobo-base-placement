@@ -105,7 +105,7 @@ def main(root, sites):
                 T = res["timing_s"]
                 row = {"site": site, "start": sname, "grasp": req["grasp"], "ok": res["ok"], "reason": res["reason"],
                        "chosen": res.get("chosen_base"), "total_s": total, "scene_s": t_scene,
-                       "wholebody_s": T["wholebody_ik_s"] + T["filter_s"], "scoring_s": T["scoring_s"], "arm_plan_s": T["arm_plan_s"],
+                       "wholebody_s": T["wholebody_ik_s"] + T["filter_s"], "scoring_s": T["scoring_s"], "arm_plan_s": T.get("arm_plan_s", 0.0),
                        "lm_solve_s": prof.t["lm_solve"], "lm_check_s": prof.t["lm_check"], "optimiser_s": prof.t["optimiser"],
                        "load_envs_s": prof.t["load_envs"], "calls": prof.calls, "stations": prof.stations}
                 rows.append(row)

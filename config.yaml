@@ -67,6 +67,8 @@ profile:
   min_candidates: 15                    # 可停車的候選站位至少要這麼多才開始評分
   scorer_group: 4                       # 評分：每次 GPU 呼叫評幾個站位（4 × 27 = 108 題）；方塊很多時自動減少
   scorer_seeds: 8                       # 每題 IK 種子數。LM 種子與最佳化結果取聯集後，真實地圖上 4／8 種子與 32 種子選出同一站位
+  # 手臂軌跡規劃不在 plan() 裡：Kachaka 到位、重新確認目標後再呼叫 plan_arm()（run_demo.py --arm）
+  build_arm_planner: false               # true：啟動時就建 MotionPlanner（第一次呼叫 plan_arm 不用等）
   planner_ik_seeds: 8
   planner_trajopt_seeds: 1
   collision_cache_cuboids: 64           # 場景方塊上限；地圖轉出來的方塊太多就加大

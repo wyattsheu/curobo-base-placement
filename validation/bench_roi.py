@@ -68,8 +68,8 @@ def main(root, sites):
                     row = {"site": site, "obj": f"{o['cls']}#{o['inst']}", "start": sname, "grasp": req["grasp"], "setting": tag,
                            "ok": res["ok"], "reason": res["reason"], "robustness": res.get("robustness"),
                            "chosen_map": res.get("chosen_map"), "n_boxes": len(sc.boxes_base), "boxes_used": T.get("boxes_used"),
-                           "scene_s": t_scene, "scoring_s": T["scoring_s"], "arm_plan_s": T["arm_plan_s"],
-                           "plan_s": sum(T[k] for k in ("wholebody_ik_s", "filter_s", "scoring_s", "arm_plan_s")),
+                           "scene_s": t_scene, "scoring_s": T["scoring_s"], "arm_plan_s": T.get("arm_plan_s", 0.0),
+                           "plan_s": sum(T.get(k, 0.0) for k in ("wholebody_ik_s", "filter_s", "scoring_s")),
                            "total_s": time.perf_counter() - t0, "n_checked": res["n_checked"]}
                     rows.append(row)
                     print(json.dumps(row, default=float), flush=True)

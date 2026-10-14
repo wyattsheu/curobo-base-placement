@@ -1,16 +1,18 @@
 """Where should Kachaka go so that the arm can reach the ALREADY-DECIDED gripper pose? (plan B, cuRobo v2)
 
-    planner = BasePlacementPlanner(cfg, scene)      # builds every solver once (≈ 6 s, do it at start-up)
-    result  = planner.plan()                        # base pose to drive to + arm check at that pose
+    planner = BasePlacementPlanner(cfg)             # builds the solvers once (do it at start-up)
+    planner.set_scene(scene); result = planner.plan()   # per request: the base pose to drive to
+    ...                                             # Kachaka drives there; upstream looks at the target again
+    planner.set_scene(new_scene); arm = planner.plan_arm()   # only if an arm trajectory is wanted (separate step)
 
 The gripper pose (position + orientation of tool_frame) comes from upstream and is never changed here.
 Steps inside plan():
   1. whole_body()   9-DoF IK (Kachaka x, y, yaw + 6 arm joints) for that one gripper pose → many candidate base poses
-  2. parking_ok()   Kachaka + stowed arm parked there: no collision, and standing on cells the SLAM has seen
-  3. robustness()   nearest candidate first: lock the base at 27 perturbed poses (navigation error) and re-solve the
-                    6-DoF arm IK for the same gripper pose, all in ONE multi-env IK call; keep the first that passes
-  4. plan_arm()     base locked at that pose: 6-DoF MotionPlanner from the stowed arm to the gripper pose;
-                    on failure go back to 3 with the next candidate
+  2. parking_ok()   Kachaka parked there: its base clear of every box, and standing on drivable cells
+  3. scoring        nearest candidate first: lock the base at 27 perturbed poses (navigation error) and re-solve the
+                    6-DoF arm IK for the same gripper pose; the first candidate that passes is the answer
+                    (none passes: the most robust one, if not below min_accept)
+plan_arm() (6-DoF MotionPlanner from the stowed arm) is not part of plan().
 Everything is in the base frame (Kachaka now). result["chosen_map"] is the goal for Navigate_to_pose.
 """
 import math
@@ -95,19 +97,11 @@ class BasePlacementPlanner:
                      collision_cache=near_cache, num_seeds=P["scorer_seeds"], self_collision_check=True, max_batch_size=self.Eo, multi_env=True))
         self.ik_opt.config.exit_early = False; self.ik_opt.config.use_lm_seed = False
         self.cub_opt = self._cuboids(self.ik_opt)
-        # 4. arm-only motion planner
-        self.planner = MotionPlanner(MotionPlannerCfg.create(robot=rc_arm, scene_model=empty,
-                     collision_cache=near_cache, use_cuda_graph=True,
-                     num_ik_seeds=P["planner_ik_seeds"], num_trajopt_seeds=P["planner_trajopt_seeds"]))
-        self.planner.warmup(enable_graph=True, num_warmup_iterations=1)
+        # arm motion planner: not part of plan(); built the first time plan_arm() is called
+        self.planner, self._arm_cfg = None, (rc_arm, near_cache, empty)
+        if P.get("build_arm_planner", False):
+            self._arm_planner()
         self.base_sph = np.array([[*k['center'], k['radius']] for k in kachaka_spheres(cfg)])   # 2. parking check: the base only
-        st = self.planner.default_joint_state
-        stow = cfg["robot"].get("stow_arm")
-        self.stow = np.array(stow if stow else [float(st.position.reshape(-1)[list(st.joint_names).index(j)]) for j in ARM_JOINTS])
-        start = st.clone(); flat = start.position.view(-1); names = list(start.joint_names)
-        for j, v in zip(ARM_JOINTS, self.stow):                 # the arm trajectory starts from the stowed arm
-            flat[names.index(j)] = float(v)
-        self.start = start.unsqueeze(0)
         self.write_boxes(self.cub_wb, np.zeros((1, 3)), near=False)
         for _ in range(2):                                      # warm-up (CUDA graphs)
             self.ik_wb.solve_pose(self.goal_from(np.zeros((1, 3))), return_seeds=P["wb_seeds"])
@@ -385,9 +379,32 @@ class BasePlacementPlanner:
             S[i]["ok"][e] |= bool(o); S[i]["todo"][e] = False
 
     # ------------------------------------------------------------ step 4
-    def plan_arm(self, base):
-        self.planner.update_world(self.scene_at(base, near=True))
-        pr = self.planner.plan_pose(self.goal_from(np.asarray([base], float)), self.start, max_attempts=5)
+    def _arm_planner(self):
+        """6-DoF MotionPlanner (base locked), built on first use; the trajectory starts from the stowed arm."""
+        if self.planner is None:
+            P = self.cfg["profile"]; rc_arm, near_cache, empty = self._arm_cfg
+            self.planner = MotionPlanner(MotionPlannerCfg.create(robot=rc_arm, scene_model=empty,
+                         collision_cache=near_cache, use_cuda_graph=True,
+                         num_ik_seeds=P["planner_ik_seeds"], num_trajopt_seeds=P["planner_trajopt_seeds"]))
+            self.planner.warmup(enable_graph=True, num_warmup_iterations=1)
+            st = self.planner.default_joint_state
+            stow = self.cfg["robot"].get("stow_arm")
+            self.stow = np.array(stow if stow else [float(st.position.reshape(-1)[list(st.joint_names).index(j)]) for j in ARM_JOINTS])
+            start = st.clone(); flat = start.position.view(-1); names = list(start.joint_names)
+            for j, v in zip(ARM_JOINTS, self.stow):
+                flat[names.index(j)] = float(v)
+            self.start = start.unsqueeze(0)
+        return self.planner
+
+    def plan_arm(self, base=(0.0, 0.0, 0.0)):
+        """Arm trajectory (stowed arm → the scene's gripper pose) with the base standing at `base` (base frame).
+        Not part of plan(): call it once Kachaka has arrived and the target has been seen again — set_scene() with the
+        new request, then plan_arm() (the robot now stands at the origin). → {"traj": N × 6, "dt"} or None."""
+        t = time.perf_counter()
+        planner = self._arm_planner()
+        planner.update_world(self.scene_at(base, near=True))
+        pr = planner.plan_pose(self.goal_from(np.asarray([base], float)), self.start, max_attempts=5)
+        self.T["arm_plan_s"] = time.perf_counter() - t
         if pr is None or not bool(pr.success.any()):
             return None
         n = int(pr.interpolated_last_tstep.view(-1)[0]); names = list(pr.interpolated_trajectory.joint_names)
@@ -414,7 +431,7 @@ class BasePlacementPlanner:
     def plan(self):
         P, Rb = self.cfg["profile"], self.cfg["robustness"]
         th, floor = Rb["threshold"], Rb.get("min_accept", 0.0)
-        for k in ("wholebody_ik_s", "filter_s", "scoring_s", "arm_plan_s"):
+        for k in ("wholebody_ik_s", "filter_s", "scoring_s"):
             self.T[k] = 0.0
         # 1.+2. whole-body IK (fresh seeds each round) until enough parkable candidates
         Q, rounds = np.zeros((0, 9)), 0
@@ -426,46 +443,29 @@ class BasePlacementPlanner:
         dist = np.hypot(U[:, 0], U[:, 1]) if len(U) else np.zeros(0)
         order = [int(j) for j in np.argsort(dist) if park[j]]
         # 3.+4. nearest first: robustness, then plan the first one that passes
-        checked, tried, best, arm = {}, [], None, None
+        checked, best = {}, None
         if P.get("lazy_optimiser", True):
-            # the same nearest-first rule, but the optimiser only runs where it can change the answer: LM scores every
-            # candidate first; a station's unsolved perturbations are optimised when its final score is needed
+            # the optimiser only runs where it can change the answer: LM scores every candidate first; a station's
+            # unsolved perturbations are optimised when its final score is needed
             S = self._timed("scoring_s", self._lm_pass, U, order)
             for j in order:
                 self._timed("scoring_s", self._finish, S, order, j)
-                checked[j] = rj = float(S[j]["ok"].mean())
-                if rj < th - 1e-9:
-                    continue
-                arm = self._timed("arm_plan_s", self.plan_arm, tuple(U[j, :3]))
-                tried.append({"idx": j, "ok": arm is not None, "robustness": rj})
-                if arm is not None:
+                checked[j] = float(S[j]["ok"].mean())
+                if checked[j] >= th - 1e-9:
                     best = j; break
         else:                                                        # previous way: whole groups through the optimiser
             for g0 in range(0, len(order), self.group):
                 idx = np.array(order[g0:g0 + self.group])
                 rob = self._timed("scoring_s", self.robustness, U[idx, :3])
                 checked.update(zip(idx.tolist(), rob.tolist()))
-                for j, rj in zip(idx.tolist(), rob.tolist()):
-                    if rj < th - 1e-9:
-                        continue
-                    arm = self._timed("arm_plan_s", self.plan_arm, tuple(U[j, :3]))
-                    tried.append({"idx": j, "ok": arm is not None, "robustness": rj})
-                    if arm is not None:
-                        best = j; break
+                best = next((j for j, rj in zip(idx.tolist(), rob.tolist()) if rj >= th - 1e-9), None)
                 if best is not None:
                     break
         below = False
-        if best is None:                     # nobody reached the threshold: try the most robust ones, and say so
-            done = {t["idx"] for t in tried}
-            for j in sorted(checked, key=lambda j: (-checked[j], dist[j])):
-                if checked[j] <= 0 or checked[j] < floor - 1e-9:
-                    break
-                if j in done:
-                    continue
-                arm = self._timed("arm_plan_s", self.plan_arm, tuple(U[j, :3]))
-                tried.append({"idx": j, "ok": arm is not None, "robustness": checked[j]})
-                if arm is not None:
-                    best, below = j, True; break
+        if best is None and checked:         # nobody reached the threshold: the most robust one, if not below min_accept
+            j = min(checked, key=lambda j: (-checked[j], dist[j]))
+            if checked[j] > 0 and checked[j] >= floor - 1e-9:
+                best, below = j, True
         # why there is no answer, at the first step that ran out of candidates
         if best is not None:
             reason = "ok"
@@ -475,20 +475,18 @@ class BasePlacementPlanner:
             reason = "outside_cone"          # solutions exist, but none keeps the target in the arm's ±30° safety cone
         elif not park.any():
             reason = "cannot_park"           # the base collides or leaves the drivable area at every candidate
-        elif not tried:
-            reason = "not_robust"            # parkable, but every candidate scores below min_accept
         else:
-            reason = "arm_plan_failed"       # robust enough, but no arm trajectory from the stowed pose
+            reason = "not_robust"            # parkable, but every candidate scores below min_accept
         res = {"ok": best is not None, "reason": reason, "below_threshold": below,
                "robustness": checked.get(best) if best is not None else None,
                "max_robustness": max(checked.values()) if checked else None,
                "n_success": int(len(Q)), "wb_rounds": rounds, "n_cone": n_cone, "window": self.window,
                "q_success": Q.tolist(), "uniq": U.tolist(), "parked_ok": park.tolist(),
-               "rob": [checked.get(i) for i in range(len(U))], "n_checked": len(checked), "tried_plans": tried}
+               "rob": [checked.get(i) for i in range(len(U))], "n_checked": len(checked)}
         if best is not None:
             ch = tuple(float(v) for v in U[best, :3])
             res.update({"chosen_base": ch, "chosen_map": base_to_map_pose(ch, self.scene.base_pose_in_map),
-                        "chosen_whole_body_q": U[best].tolist(), "arm": arm,
+                        "chosen_whole_body_q": U[best].tolist(),
                         "rank_by_distance": int(np.argsort(dist).tolist().index(best)) + 1})
         res["timing_s"] = dict(self.T); res["memory_mb"] = dict(self.MEM)
         return res

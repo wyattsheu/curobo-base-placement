@@ -93,11 +93,10 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 
 | 欄位 | 意義 |
 |---|---|
-| **`ok`** | true = 找到站位，而且停過去後手臂規劃成功 |
+| **`ok`** | true = 找到站位 |
 | **`reason`** | `ok`，或沒有結果時卡在哪一步（見 2.3） |
 | **`chosen_map`** | **(x, y, yaw) 地圖座標 → 直接給 Kachaka `Navigate_to_pose`**（只有 `ok` 時才有） |
 | `chosen_base` | 同一個站位，相對於現在位置（base 座標）的移動量 |
-| **`arm.traj`、`arm.dt`** | 停好後，手臂從收起姿態到夾爪位姿的軌跡：N × 6（joint1–6，弧度），每步 `dt` 秒 |
 | **`at_goal.grasp_pose_in_piper_base`** | 站在 `chosen_map` 時，上游的夾爪位姿在 Piper 基座座標的值 → 可直接給 mm_actions 的 `move_arm_to_pose` |
 | `robustness` | 選中站位的穩健度：假設 Kachaka 停歪 ±5 cm、±5°（27 種），手臂還抓得到的比例 |
 | `below_threshold` | true = 沒有站位達到 `threshold`，選中的是退路（見 2.2） |
@@ -107,13 +106,13 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 | `target_points`、`target_source` | 排除了幾個目標物的點、用哪種方式（`slam_mask` / `class_near_grasp` / `radius_fallback`）|
 | `known_source` | 可停車區域的依據：`occupancy`（Kachaka 2D 地圖）或 `slam_points` |
 | `n_success`、`n_cone`、`parked_ok`、`n_checked` | 每一步剩下多少候選：IK 解數、護欄內的解數、每個候選能不能停、評過分的站位數 |
-| `q_success`、`uniq`、`rob`、`tried_plans` | 中間結果（候選站位、評分、試過的手臂規劃），除錯與可視化用 |
+| `q_success`、`uniq`、`rob` | 中間結果（候選站位、評分），除錯與可視化用 |
 
 ### 2.2 穩健度門檻：`threshold` 和 `min_accept`（`config.yaml` 的 `robustness`）
 
-1. 由近到遠評分，第一個穩健度 ≥ `threshold`（預設 1.0，27 種全過）而且手臂規劃成功的站位就採用。
-2. 沒有站位達到 `threshold` 時，把評過分的站位依穩健度由高到低排，只試 ≥ `min_accept`（預設 0.5）的，
-   第一個手臂規劃成功的就採用，`below_threshold = true`。
+1. 由近到遠評分，第一個穩健度 ≥ `threshold`（預設 1.0，27 種全過）的站位就採用。
+2. 沒有站位達到 `threshold` 時，採用評過分的站位中最穩健的（同分取最近），但不能低於 `min_accept`（預設 0.5），
+   `below_threshold = true`。
 3. 都沒有就 `ok = false`、`reason = not_robust`，不會把只有一兩種擾動抓得到的站位當成功回傳。
 
 所以不需要手動把 `threshold` 降到 0.9：退路會自動拿到這個場景最高的分數，`min_accept` 決定最低能接受多少。
@@ -130,7 +129,6 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 | `outside_cone` | 有解，但都超出 ±30° 護欄（`robot.bearing_limit_rad`） | 換抓法，或放寬護欄 |
 | `cannot_park` | 有解，但底盤停的位置都不在可行駛區域（Kachaka 2D 地圖或 SLAM 看過的地板） | 檢查地圖，或換抓法 |
 | `not_robust` | 停得進去，但穩健度都低於 `min_accept`；看 `max_robustness` 差多少 | 冒險降 `min_accept`，或換抓法 |
-| `arm_plan_failed` | 夠穩，但手臂從收起姿態規劃不出軌跡 | 檢查 `robot.stow_arm`，或重試 |
 
 注意：
 - `no_ik_solution` 是取樣沒找到（128 種子 × 最多 4 輪），不是證明無解；解空間很窄時可能漏掉。
@@ -140,10 +138,18 @@ np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)      
 
 每一種 reason 都用場景驗證過，見第 8 節。
 
-### 2.4 到位後
+### 2.4 到位後：手臂軌跡是另一個步驟
 
-實機上，Kachaka 到位後應該用**實際到達的位置**重新呼叫一次：`scene_from_slam(…, 到達位置, 同一個夾爪位姿)` ＋只有手臂 6 軸的
-MotionPlanner（`robot_cfg(cfg, lock_base=True)`）。`placement.py:183 plan_arm` 就是這個流程。
+`plan()` 只回答「要移到哪裡」，**不做手臂軌跡規劃**。Kachaka 到位、上游用鏡頭重新確認目標的座標之後，
+用**實際到達的位置**和新的夾爪位姿送一個新請求，只規劃手臂：
+
+```bash
+python run_demo.py --lab-map <map> --request arrived.json --arm      # 或 --serve 時那一行加 "arm": true
+```
+
+程式裡是 `planner.set_scene(新場景)` 再 `planner.plan_arm()`（底盤鎖在現在的位置，6 軸 MotionPlanner 從收起姿態開始）。
+輸出 `arm.traj`（N × 6，joint1–6，弧度）、`arm.dt`；規劃不出來時 `reason = arm_plan_failed`，可以檢查 `robot.stow_arm` 或重試。
+MotionPlanner 在第一次呼叫時才建立（約 2–3 s）；`profile.build_arm_planner: true` 則在啟動時就建好。
 
 ---
 
@@ -228,14 +234,15 @@ slam.npz + request.json（map 座標）   或   --lab-map 實驗室匯出資料�
    │   :237 objects_to_boxes()  依類別 → 3D 連通物體 → :216 依高度分層 → :171 decompose() 包方塊（不填目標物的位置）
    ▼
 PlanningScene（base 座標 = Kachaka 現在的位置）
-   │ placement.py:48 BasePlacementPlanner(cfg, scene)   一次建好所有 solver（約 7 s，開機時做一次）
-   │ placement.py:209 plan()
-   │   1 :132 whole_body()   9 軸 IK：同一個夾爪位姿 → 很多候選站位 (x, y, ψ)
-   │   2 :201 _candidates()  ±30° 護欄（robot_model.py:133）＋ :141 parking_ok() 底盤不撞、在可行駛區域
-   │   3 :163 robustness()   由近到遠，27 種到位誤差各重解 6 軸 IK
-   │   4 :183 plan_arm()     底盤鎖住，從收起姿態做 6 軸 MotionPlanner；失敗就換下一個（:239 都沒達標時用最穩健的，但不低於 min_accept；:250 reason）
+   │ placement.py BasePlacementPlanner(cfg)   開機時建好 solver；每個請求 set_scene(scene) 只把方塊寫進 tensor
+   │ placement.py plan()
+   │   1 whole_body()   9 軸 IK：同一個夾爪位姿 → 很多候選站位 (x, y, ψ)
+   │   2 _candidates()  ±30° 護欄（robot_model.in_safety_cone）＋ parking_ok() 底盤不撞、在可行駛區域
+   │   3 _lm_pass() / _finish()   由近到遠，27 種到位誤差各重解 6 軸 IK（先 LM，需要時才最佳化）；
+   │                    第一個 27/27 的就是答案（都沒有時用最穩健的，但不低於 min_accept）
    ▼
-chosen_map → Navigate_to_pose；arm.traj、at_goal.grasp_pose_in_piper_base → 到位後的手臂
+chosen_map → Navigate_to_pose；at_goal.grasp_pose_in_piper_base → 到位後的手臂
+   │ 到位、重新確認目標後（另一個步驟）：set_scene(新場景) → plan_arm() → arm.traj
 ```
 
 | 座標系 | 定義 | 轉換 |
@@ -281,18 +288,19 @@ python validation/run_scenarios.py no_drivable_area   # 只跑指定的
 `validation/` 是獨立的測試資料夾：主程式不引用它，改動只在記憶體裡做（改 config 的值、移動夾爪位姿、把可行駛區域挖掉），
 不改 `config.yaml` 或 `test_maps/`。不用的話可以整個忽略。各程式的說明見 `validation/README.md`。
 
-結果（RTX PRO 6000，2026-10-14，8/8 通過）：
+結果（RTX PRO 6000，2026-10-14，9/9 通過）：
 
-| 場景 | 改了什麼 | reason | IK 解 | 護欄內 | 可停 | 穩健度（選中 / 最高） | 手臂規劃次數 |
-|---|---|---|---|---|---|---|---|
-| `baseline` | 不改 | `ok`（退路） | 43 | 33 | 30 | 0.59 / 0.59 | 1 |
-| `loose_threshold` | `threshold` 降到 0.5 | `ok`（直接達標） | 43 | 33 | 30 | 0.52 / 0.52 | 1 |
-| `unreachable` | 夾爪位姿抬到離地 2.0 m | `no_ik_solution` | 0 | 0 | 0 | – | 0 |
-| `gripper_in_cabinet` | 夾爪位姿放進櫃子裡（夾爪本身一定碰撞） | `no_ik_solution` | 0 | 0 | 0 | – | 0 |
-| `cone_closed` | 護欄收到 ±0°（強制觸發這個分支） | `outside_cone` | 181 | 0 | 0 | – | 0 |
-| `no_drivable_area` | 目標 1.2 m 內都標成不可行駛 | `cannot_park` | 181 | 123 | 0 | – | 0 |
-| `sloppy_navigation` | 到位誤差假設成 ±15 cm、±15° | `not_robust` | 43 | 33 | 30 | – / 0.26 | 0 |
-| `bad_stow` | 收起姿態設成全零（碰撞球自我重疊） | `arm_plan_failed` | 43 | 33 | 30 | – / 0.59 | 7 |
+| 場景 | 改了什麼 | reason | IK 解 | 護欄內 | 可停 | 穩健度（選中 / 最高） |
+|---|---|---|---|---|---|---|
+| `baseline` | 不改 | `ok`（退路） | 43 | 33 | 30 | 0.67 / 0.67 |
+| `loose_threshold` | `threshold` 降到 0.5 | `ok`（直接達標） | 43 | 33 | 30 | 0.59 / 0.59 |
+| `unreachable` | 夾爪位姿抬到離地 2.0 m | `no_ik_solution` | 0 | 0 | 0 | – |
+| `gripper_in_cabinet` | 夾爪位姿放進櫃子裡（夾爪本身一定碰撞） | `no_ik_solution` | 0 | 0 | 0 | – |
+| `cone_closed` | 護欄收到 ±0°（強制觸發這個分支） | `outside_cone` | 181 | 0 | 0 | – |
+| `no_drivable_area` | 目標 1.2 m 內都標成不可行駛 | `cannot_park` | 181 | 123 | 0 | – |
+| `sloppy_navigation` | 到位誤差假設成 ±15 cm、±15° | `not_robust` | 43 | 33 | 30 | – / 0.26 |
+| `arm_plan` | 不改；選好站位後另外呼叫 `plan_arm()` | `ok` | 43 | 33 | 30 | 0.67 / 0.67 |
+| `bad_stow` | 收起姿態設成全零（碰撞球自我重疊），另外呼叫 `plan_arm()` | `arm_plan_failed` | 43 | 33 | 30 | 0.67 / 0.67 |
 
 - `loose_threshold` 評了 4 個站位就停（由近到遠，第一組就有達標的），其他場景評完全部 30 個。
 - IK 解 181 的兩個場景：可停的候選一直不到 `min_candidates`（15 個），所以 IK 跑滿 `wb_rounds_max`（4 輪）才停。

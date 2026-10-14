@@ -4,6 +4,7 @@
   python run_demo.py --npz /maps/gs_map_….npz --request request.json
   python run_demo.py --lab-map robot_ws/data/lab/map803_0930 --request request.json     # the lab's exported map
   python run_demo.py --lab-map <map> --serve < requests.txt     # solvers built once; one request per line (path or JSON)
+  python run_demo.py --lab-map <map> --request request.json --arm   # separate step, once Kachaka is there: arm trajectory
 
 request.json (written by upstream, see scene_io.load_request):
   {"base_pose_in_map": [x, y, yaw],                                    # Kachaka localisation (kachaka_base_link)
@@ -16,6 +17,8 @@ The printed JSON line starts with @@JSON@@:
   result["chosen_map"]                          (x, y, yaw) goal for Navigate_to_pose (same form as Stage1's goal)
   result["at_goal"]["grasp_pose_in_piper_base"] the decided gripper pose seen from the Piper base once Kachaka
                                                 stands at chosen_map → mm_actions move_arm_to_pose
+The arm trajectory is NOT part of this answer. Once Kachaka stands at chosen_map and upstream has looked at the target
+again, send that new request with --arm (or "arm": true in --serve): the robot is taken to stand where it is now, and
   result["arm"]["traj"]                         6-DoF joint trajectory from the stowed arm (cuRobo MotionPlanner)
 """
 import argparse
@@ -63,8 +66,9 @@ def load_map(args, cache):
     return cache[key]
 
 
-def solve(planner_or_none, cfg, args, req, cache):
-    """One request → result dict. With a long-running planner the solvers are reused; otherwise built for this scene."""
+def solve(planner_or_none, cfg, args, req, cache, arm=False):
+    """One request → result dict. With a long-running planner the solvers are reused; otherwise built for this scene.
+    arm: Kachaka already stands where it should — plan the arm trajectory instead of a base pose."""
     t0 = time.perf_counter()
     data, names, occ = load_map(args, cache)
     g = req["grasp_pose_in_map"]
@@ -77,6 +81,11 @@ def solve(planner_or_none, cfg, args, req, cache):
         planner = BasePlacementPlanner(cfg, scene)
     else:
         planner = planner_or_none; planner.set_scene(scene)
+    if arm:                                   # separate step: the robot already stands there, only the arm moves
+        traj = planner.plan_arm()
+        return {"ok": traj is not None, "reason": "ok" if traj is not None else "arm_plan_failed", "arm": traj,
+                "timing_s": {"scene_from_slam_s": t_scene, "arm_plan_s": planner.T.get("arm_plan_s", 0.0),
+                             "request_s": time.perf_counter() - t0}}
     res = planner.plan()
     res["timing_s"]["scene_from_slam_s"] = t_scene
     res.update({"n_boxes": len(scene.boxes_base), "boxes_base": scene.boxes_base, "base_pose_in_map": list(scene.base_pose_in_map),
@@ -100,6 +109,8 @@ def main(argv=None):
     ap.add_argument("--request", default=str(HERE / "test_maps/request.json"))
     ap.add_argument("--occupancy", default=None, help="Kachaka's 2D map yaml: park only on its free cells (auto with --lab-map)")
     ap.add_argument("--ignore-classes", nargs="*", default=["floor"], help="classes that are never obstacles")
+    ap.add_argument("--arm", action="store_true", help="separate step once Kachaka has arrived: plan the arm trajectory "
+                    "from where it stands (no base search)")
     ap.add_argument("--serve", action="store_true",
                     help="build the solvers once, then answer one request per stdin line: a request.json path or the request "
                          "itself as JSON; optional keys \"lab_map\" / \"npz\" / \"occupancy\" switch maps (each map is read once)")
@@ -107,7 +118,7 @@ def main(argv=None):
     cfg = load_config(args.config)
     cache = {}
     if not args.serve:
-        res = solve(None, cfg, args, scene_io.load_request(args.request, cfg), cache)
+        res = solve(None, cfg, args, scene_io.load_request(args.request, cfg), cache, arm=args.arm)
         emit(res)
         return res
     from placement import BasePlacementPlanner
@@ -122,7 +133,7 @@ def main(argv=None):
             req = msg.get("request", msg)
             req = scene_io.load_request(req, cfg) if isinstance(req, str) else scene_io.normalize_request(req, cfg)
             a = argparse.Namespace(**{**vars(args), **{k: msg[k] for k in ("lab_map", "npz", "occupancy") if k in msg}})
-            emit(solve(planner, cfg, a, req, cache))
+            emit(solve(planner, cfg, a, req, cache, arm=bool(msg.get("arm"))))
         except Exception as e:                                                  # keep serving
             emit({"ok": False, "reason": "error", "error": f"{type(e).__name__}: {e}"})
 

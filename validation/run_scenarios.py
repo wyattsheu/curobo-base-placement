@@ -58,8 +58,11 @@ SCENARIOS = [
     ("cone_closed",       "outside_cone",    cfg_set(**{"robot.bearing_limit_rad": 0.0})),
     ("no_drivable_area",  "cannot_park",     no_drive_near_grasp(1.2)),
     ("sloppy_navigation", "not_robust",      cfg_set(**{"robustness.perturb_xy_m": 0.15, "robustness.perturb_yaw_deg": 15.0})),
+    # plan_arm() is a separate step (after Kachaka has arrived): these two plan the arm at the chosen station
+    ("arm_plan",          "ok",              None),
     ("bad_stow",          "arm_plan_failed", cfg_set(**{"robot.stow_arm": [0.0] * 6})),
 ]
+ARM_STEP = {"arm_plan", "bad_stow"}
 
 
 def load_test_scene():
@@ -83,12 +86,15 @@ def main(names):
         cfg, scene = copy.deepcopy(cfg0), copy.deepcopy(scene0)
         if change:
             change(cfg, scene)
-        r = BasePlacementPlanner(cfg, scene).plan()
+        pl = BasePlacementPlanner(cfg, scene)
+        r = pl.plan()
+        if name in ARM_STEP and r["ok"]:
+            r["reason"] = "ok" if pl.plan_arm(tuple(r["chosen_base"])) is not None else "arm_plan_failed"
         ok = r["reason"] == want
         failed += not ok
         print(f"{'PASS' if ok else 'FAIL'}  {name:18s} reason={r['reason']:16s} expected={want:16s} "
               f"ik={r['n_success']} cone={r['n_cone']} park={sum(r['parked_ok'])} scored={r['n_checked']} "
-              f"robustness={fmt(r['robustness'])} max={fmt(r['max_robustness'])} plans={len(r['tried_plans'])}",
+              f"robustness={fmt(r['robustness'])} max={fmt(r['max_robustness'])}",
               flush=True)
     return 1 if failed else 0
 
