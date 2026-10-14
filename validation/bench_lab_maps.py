@@ -32,7 +32,7 @@ from bench_multi_grasp import make_grasps, build, candidates, score_pool, sync  
 GRASPABLE = ("bottle", "remote control", "mm chocolate", "book", "headphones", "box", "laptop", "cup", "can")
 MAX_OBJECTS = 2
 N_GRASPS = 20
-K_MAX = 8                       # stations scored per grasp (nearest first)
+K_MAX = 3                       # stations scored per grasp (nearest first); real maps (~350–950 boxes) are slow
 SCORER_SEEDS = [16, 8, 4]       # 16 = today's config.yaml
 REF_SEEDS = 32                  # reference (64 is too slow with the ~350 boxes of a real map)
 

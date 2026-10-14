@@ -181,6 +181,9 @@ python -c "import curobo, torch; print(curobo.__version__, torch.__version__, to
 ```bash
 python run_demo.py                                                   # test_maps/slam.npz + test_maps/request.json
 python run_demo.py --npz /maps/xxx.npz --request request.json
+# 常駐：solver 只在啟動時建一次（Thor 約 12 s），之後每行一個請求（request.json 路徑，或請求本身的 JSON，
+# 可帶 "lab_map" / "npz" / "occupancy" 換地圖，地圖只讀一次），每個請求印一行 @@JSON@@
+python run_demo.py --lab-map /maps/auto_20260826 --serve < requests.txt
 ```
 
 ### 從沒有 GPU 的電腦丟到 server 跑（server 上不留任何檔案）
@@ -262,9 +265,9 @@ chosen_map → Navigate_to_pose；arm.traj、at_goal.grasp_pose_in_piper_base �
 - 收起姿態用 mm_actions 夾到東西後的姿態；空手的 home（全零）完全折疊，robot129 的碰撞球在那裡重疊，cuRobo 會拒絕當起點。
 - 需確認：SLAM 與 Kachaka 用同一張地圖座標、地板在 z ≈ 0；上游夾爪位姿用的 frame 是 `pinch_center`。
 - 點雲轉出的方塊比實物大約 1–2 cm（含安全餘量）；桌下等懸空空間會被當成實心。
-- 穩健度用 16 個 IK 種子評分，每次執行會有跳動（測試場景同一站位 0.59–0.67），測試場景走的是「用最穩健的」退路；可調 `profile.scorer_seeds`、`robustness.threshold` 或 `robustness.min_accept`。
+- 穩健度用 8 個 IK 種子評分（見第 9 節），每次執行仍可能有小幅跳動；可調 `profile.scorer_seeds`、`robustness.threshold` 或 `robustness.min_accept`。
 - 停車檢查只用底盤的 10 顆球，直接用 numpy 算到方塊的距離（`placement.py:141`）；cuRobo v2 這個版本的 `collision_checking.validate()` 有 bug，沒有使用。
-- 時間只在 RTX PRO 6000 上量過（solver 建立約 9 s 一次性；找站位到手臂規劃約 1.5 s；GPU 峰值約 0.7 GB），Thor 上需要實測。
+- 時間見第 9 節（Thor + 實驗室真實地圖）。
 
 ## 8. 驗證場景
 
@@ -295,3 +298,38 @@ python validation/run_scenarios.py no_drivable_area   # 只跑指定的
 - IK 解 181 的兩個場景：可停的候選一直不到 `min_candidates`（15 個），所以 IK 跑滿 `wb_rounds_max`（4 輪）才停。
 - `bad_stow` 會印出 cuRobo 的 `Start or End state in collision`，是預期的。
 - 穩健度每次執行會跳動，數字可能和上表差一點，但 reason 應該一樣。
+
+
+## 9. 在 Thor 上用真實地圖：加速與驗證
+
+真實 SLAM 地圖會轉成 350–950 個方塊（測試場景只有 12 個）。原本在 Thor 上，每個請求光建 solver 就要 56 s，
+評分每個站位要 4–14 s。改了三件事，選出的站位不變或更好：
+
+1. **只放手臂碰得到的方塊**（`placement.load_envs`、`robot_model.arm_reach`）。以肩關節為中心，任何手臂姿態下
+   碰撞球都在 0.887 m 內（三角不等式，可證明的上界）；更遠的方塊離任何球都超過 cuRobo 的啟動距離 0.01 m，
+   對碰撞成本的貢獻精確為 0。`validation/check_near_exact.py` 用 cuRobo 自己的 FK 驗證：40 萬個隨機手臂姿態
+   最遠 0.770 m；513 個真實擾動站位中，被拿掉的方塊離碰撞球最近 0.169 m。每個站位從 942 個方塊降到中位數 135 個。
+2. **評分改成「LM 種子 ∪ 最佳化結果」**（`placement.solve_envs`）。cuRobo 的 IK 先用 Levenberg-Marquardt 從隨機起點解位姿，
+   再用 MPPI + L-BFGS 處理碰撞。實測第二段會把許多「本來就有效」的 LM 解變成失敗，而且種子越多、在 batch 裡越後面越嚴重：
+   同一個站位複製 4 份放進同一批，得到 18/12/1/0 個成功（滿分 27）。兩者都經過同一套 metrics
+   （碰撞、關節限制、位姿誤差）檢查，所以任一邊有有效解就算到得了；所有 env 都已經有解時就不跑最佳化。
+   改完後，分數和每次呼叫放幾個站位無關，重複執行的跳動也幾乎消失。
+3. **常駐模式**（`run_demo.py --serve`、`BasePlacementPlanner.set_scene`）：solver 只建一次，容量固定
+   （`profile.max_scene_boxes` / `max_near_boxes`），每個請求只把方塊寫進 tensor。
+
+種子數（`validation/bench_seeds.py`，基準是 32 種子、一次一個站位）：在 ec129 與 auto_20260826 上，16／8／4 種子選出的站位都和基準相同，
+regret 都是 0，pass 判定一致率 1.00，所以預設改成 8 個。
+
+| Thor，實驗室真實地圖 | 修改前 | 修改後 |
+|---|---|---|
+| 建 solver | 每個請求 56 s | 常駐只在啟動時一次，11.9 s |
+| 評分（每個站位） | 8.7–13.6 s（16 種子） | 0.36–0.58 s（8 種子） |
+| 一個請求（常駐，auto_20260826 / ec129，12 次） | 數分鐘 | 3.6–18.5 s，通常 4–7 s；成功 12/12 |
+
+常駐模式下，剩下的時間主要是評分、手臂軌跡規劃（約 1 s），以及從點雲建場景（CPU 約 1.2 s；第一次讀地圖約 5–6 s）。
+
+```bash
+python validation/bench_near.py <地圖根目錄> <site>                  # 全部方塊 vs 只放附近：分數差、時間（各重複 3 次）
+python validation/check_near_exact.py <地圖根目錄> <site> <bench_near 的輸出>   # 被拿掉的方塊確實碰不到
+python validation/bench_seeds.py <地圖根目錄> <site> <bench_near 的輸出>        # 種子數／warm start 對 32 種子基準
+```

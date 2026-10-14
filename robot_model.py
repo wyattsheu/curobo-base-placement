@@ -149,3 +149,51 @@ def n_collision_spheres(cfg):
     """Number of collision spheres of the full robot (arm + Kachaka body), as cuRobo will see them."""
     k = robot_dict(cfg)["kinematics"]
     return sum(len(k["collision_spheres"].get(l, []) or []) for l in k["collision_link_names"])
+
+
+def _qrot(q, v):
+    w, u = q[0], np.asarray(q[1:], float); v = np.asarray(v, float)
+    return v + 2 * w * np.cross(u, v) + 2 * np.cross(u, np.cross(u, v))
+
+
+def arm_reach(cfg):
+    """(pivot, radius, tool_radius), base frame with Kachaka at the origin: in ANY joint configuration every collision
+    sphere (arm and Kachaka body) lies within `radius` of `pivot`, and the tool frame within `tool_radius`. pivot = origin
+    of the link after the arm's first joint (the shoulder); it sits on that joint's axis, so the joint does not move it.
+    A sphere's bound is the sum of the joint offsets from the pivot down to its link (+ prismatic travel) + its own
+    offset + its radius — the triangle inequality, so no pose can exceed it, whatever the joint values."""
+    import xml.etree.ElementTree as ET
+    k = robot_dict(cfg)["kinematics"]
+    up = {}                                                   # child link → (parent link, offset bound, origin xyz, type)
+    for j in ET.parse(k["urdf_path"]).getroot().findall("joint"):
+        o, lim = j.find("origin"), j.find("limit")
+        xyz = np.array([float(v) for v in (o.get("xyz", "0 0 0") if o is not None else "0 0 0").split()])
+        trav = max(abs(float(lim.get("lower", 0))), abs(float(lim.get("upper", 0)))) if j.get("type") == "prismatic" and lim is not None else 0.0
+        up[j.find("child").get("link")] = (j.find("parent").get("link"), float(np.linalg.norm(xyz)) + trav, xyz, j.get("type"))
+    for name, e in k["extra_links"].items():                  # fixed frames cuRobo adds (the tool frame)
+        if e.get("joint_type") == "FIXED" and "child_link_name" not in e:
+            t = np.asarray(e["fixed_transform"][:3], float); up[name] = (e["parent_link_name"], float(np.linalg.norm(t)), t, "fixed")
+    root = k["extra_links"]["arm_mount"]["child_link_name"]
+    first = next(c for c, (p, _, _, t) in up.items() if p == root and t in ("revolute", "continuous"))
+    mxyz, mq = arm_mount(cfg)
+    pivot = np.asarray(mxyz, float) + _qrot(mq, up[first][2])
+
+    def below(link):                                          # offsets from the pivot down to `link`; None: not below it
+        s = 0.0
+        while link != first:
+            if link not in up:
+                return None
+            p, off, _, _ = up[link]; s += off; link = p
+        return s
+    radius = 0.0
+    for L in k["collision_link_names"]:
+        for sp in k["collision_spheres"].get(L) or []:
+            c, s = np.asarray(sp["center"], float), below(L)
+            if s is not None:
+                b = s + np.linalg.norm(c)
+            elif L == root:                                   # arm base: fixed on Kachaka
+                b = np.linalg.norm(np.asarray(mxyz) + _qrot(mq, c) - pivot)
+            else:                                             # Kachaka body (base frame)
+                b = np.linalg.norm(c - pivot)
+            radius = max(radius, b + float(sp["radius"]))
+    return pivot, radius, below(cfg["robot"]["tool_frame"])

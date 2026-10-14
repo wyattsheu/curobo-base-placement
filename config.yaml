@@ -66,10 +66,16 @@ profile:
   wb_rounds_max: 4                      # 候選太少時最多再解幾輪（每輪重新抽種子）
   min_candidates: 15                    # 可停車的候選站位至少要這麼多才開始評分
   scorer_group: 4                       # 評分：每次 GPU 呼叫評幾個站位（4 × 27 = 108 題）；方塊很多時自動減少
-  scorer_seeds: 16
+  scorer_seeds: 8                       # 每題 IK 種子數。LM 種子與最佳化結果取聯集後，真實地圖上 4／8 種子與 32 種子選出同一站位
   planner_ik_seeds: 8
   planner_trajopt_seeds: 1
   collision_cache_cuboids: 64           # 場景方塊上限；地圖轉出來的方塊太多就加大
+  # 評分、規劃手臂時每個站位只放手臂碰得到的方塊（肩關節周圍 0.887 m 內，任何手臂姿態都不會超出）。
+  # 碰不到的方塊對碰撞成本的貢獻本來就是 0，拿掉不改變結果；false = 全部放（只用來比對）
+  near_boxes_only: true
+  # 常駐模式（run_demo.py --serve）：solver 只在啟動時建一次，容量固定；請求超過就報錯，改大這兩個值
+  max_scene_boxes: 1024                 # 整體 IK：搜尋視窗內的方塊上限（真實地圖約 350–950）
+  max_near_boxes: 320                   # 評分／手臂規劃：一個站位手臂碰得到的方塊上限（實測最多約 190）
 
 # 3D SLAM 地圖 → 障礙方塊（scene_io.py）
 map:

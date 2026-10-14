@@ -76,22 +76,15 @@ def robustness_multi(pl, stations, P, Qt, warm=False):
     pad = pl.E - len(fr)
     envf = np.vstack([fr, np.repeat(fr[-1:], pad, 0)]); Pe = np.vstack([Pe, np.repeat(Pe[-1:], pad, 0)])
     Qe = np.vstack([Qe, np.repeat(Qe[-1:], pad, 0)])
-    cy, sy = np.cos(-pl.Y)[None], np.sin(-pl.Y)[None]
-    dx = envf[:, None, 0] - pl.C[None, :, 0]; dy = envf[:, None, 1] - pl.C[None, :, 1]
-    inv = np.zeros((pl.E, len(pl.names), 7), np.float32)
-    inv[:, :, 0] = cy * dx - sy * dy; inv[:, :, 1] = sy * dx + cy * dy; inv[:, :, 2] = -pl.C[None, :, 2]
-    ang = envf[:, None, 2] - pl.Y[None]
-    inv[:, :, 3] = np.cos(ang / 2); inv[:, :, 6] = np.sin(ang / 2)
-    pl.cub.inv_pose[:, :len(pl.names), :7] = torch.from_numpy(inv).to(pl.cub.inv_pose.device)
+    pl.load_envs(envf)
     seed = None
     if warm:
         from robot_model import BASE_JOINTS, ARM_JOINTS
         jn = list(pl.ik_rob.joint_names)
         A = stations[:, 3:9][:, [ARM_JOINTS.index(j) for j in jn]]
         A = np.repeat(A, K, 0); A = np.vstack([A, np.repeat(A[-1:], pad, 0)])
-        seed = torch.tensor(A[:, None, :], device="cuda", dtype=torch.float32)
-    r = pl.ik_rob.solve_pose(goal_multi(pl, envf, Pe, Qe), seed_config=seed)
-    ok = r.success.reshape(pl.E, -1).any(dim=1).cpu().numpy()[:len(fr)]
+        seed = torch.tensor(A, device="cuda", dtype=torch.float32)
+    ok = pl.solve_envs(goal_multi(pl, envf, Pe, Qe), warm=seed)[:len(fr)]
     cone = np.array([in_safety_cone(pl.cfg, f[None], p[:2])[0] for f, p in zip(fr, Pe[:len(fr)])])
     return (ok & cone).reshape(n, K).mean(axis=1)
 

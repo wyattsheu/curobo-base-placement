@@ -24,10 +24,12 @@ from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.scene import Cuboid, Scene
 from curobo.types import GoalToolPose, Pose
 
-from robot_model import robot_cfg, in_safety_cone, footprint_xy, kachaka_spheres, n_collision_spheres, BASE_JOINTS, ARM_JOINTS
+from robot_model import robot_cfg, in_safety_cone, footprint_xy, kachaka_spheres, n_collision_spheres, arm_reach, BASE_JOINTS, ARM_JOINTS
 
 MPPI_PARTICLES = 25          # particles per seed in cuRobo v2's IK MPPI stage (sets the kernel size above)
-from scene_io import base_to_map_pose
+NEAR_MARGIN_M = 0.05         # beyond the arm's reach: cuRobo's largest collision activation distance (0.01 m) + slack
+IK_POS_TOL_M = 0.05          # a solved gripper pose is at least this close to the goal (cuRobo's threshold is mm-level)
+from scene_io import base_to_map_pose, base_to_map_xy
 
 
 def _sync():
@@ -45,39 +47,50 @@ def _qmul(a, b):                                              # wxyz, broadcast 
 
 
 class BasePlacementPlanner:
-    def __init__(self, cfg, scene):
-        self.cfg, self.scene = cfg, scene
-        P, Rb = cfg["profile"], cfg["robustness"]
+    def __init__(self, cfg, scene=None):
+        """With `scene`: solvers sized for that one request. Without: a long-running planner with fixed capacities
+        (profile.max_scene_boxes / max_near_boxes); every request then comes in through set_scene()."""
+        self.cfg, self.scene = cfg, None
+        P, Rb, S = cfg["profile"], cfg["robustness"], cfg["search"]
         self.T, self.MEM = {}, {}
         t0 = time.perf_counter()
-        self.gpos = np.array(scene.grasp_pos_base, float)       # decided gripper pose (base frame) — fixed
-        self.gquat = np.array(scene.grasp_quat_base, float)
-        self.window = self._window()
-        B = scene.boxes_base                                    # obstacles as arrays (base frame)
-        self.names = [b["name"] for b in B]
-        self.C = np.array([b["center"] for b in B], float); self.D = np.array([b["dims"] for b in B], float)
-        self.Y = np.array([b.get("yaw", 0.0) for b in B], float)
-        cache = {"cuboid": max(P["collision_cache_cuboids"], len(B) + 2)}
         d, a = Rb["perturb_xy_m"], math.radians(Rb["perturb_yaw_deg"])
+        self.d = d
         self.OFFS = np.array([(dx, dy, dp) for dx in (-d, 0, d) for dy in (-d, 0, d) for dp in (-a, 0, a)])
+        # every robot sphere, in any arm pose, stays within `reach` of the shoulder (`pivot`): a box farther away never comes
+        # within the activation distance of any sphere, so it adds exactly nothing to any cost or collision check
+        self.pivot, reach, self.tool_reach = arm_reach(cfg)
+        self.reach = reach + NEAR_MARGIN_M if P.get("near_boxes_only", True) else np.inf
+        if scene is not None:                                   # one request: capacities fitted to this scene
+            self._take_scene(scene)
+            n_scene, n_near = max(P["collision_cache_cuboids"], len(self.names) + 2), self._near_bound(d) + 2
+            window = self.window
+        else:                                                   # long-running: fixed capacities
+            self._take_scene(None)
+            n_scene, n_near = P["max_scene_boxes"], P["max_near_boxes"]
+            window = {"x": list(S["window_x"]), "y": list(S["window_y"])}
+        cache, near_cache = {"cuboid": n_scene}, {"cuboid": n_near}  # whole-body IK (base moves anywhere) / one station
+        self.T["scene_cache"], self.T["near_cache"] = float(n_scene), float(n_near)
         # one warp kernel covers envs x seeds x particles x robot spheres x cuboids and must stay below 2^31 work items:
         # with many boxes (real maps) or many spheres, score fewer stations per call instead of failing
-        per_station = len(self.OFFS) * P["scorer_seeds"] * MPPI_PARTICLES * n_collision_spheres(cfg) * cache["cuboid"]
+        per_station = len(self.OFFS) * P["scorer_seeds"] * MPPI_PARTICLES * n_collision_spheres(cfg) * near_cache["cuboid"]
         self.group = max(1, min(P["scorer_group"], (2**31 - 1) // per_station))
         self.T["scorer_group_used"] = float(self.group)
-        rc_wb, rc_arm = robot_cfg(cfg, False, self.window), robot_cfg(cfg, True)
+        rc_wb, rc_arm = robot_cfg(cfg, False, window), robot_cfg(cfg, True)
+        empty = {"cuboid": {"_": {"dims": [0.01] * 3, "pose": [0.0, 0.0, -10.0, 1.0, 0.0, 0.0, 0.0]}}}   # filled per request
         # 1. whole-body IK: one problem (the decided gripper pose)
-        self.ik_wb = InverseKinematics(InverseKinematicsCfg.create(robot=rc_wb, scene_model=self.scene_at((0, 0, 0)),
+        self.ik_wb = InverseKinematics(InverseKinematicsCfg.create(robot=rc_wb, scene_model=empty,
                      collision_cache=cache, num_seeds=P["wb_seeds"], self_collision_check=True))
+        self.cub_wb = self._cuboids(self.ik_wb)
         # 3. robustness: one problem per (candidate, perturbation), each with its own copy of the scene
         self.E = self.group * len(self.OFFS)
-        self.ik_rob = InverseKinematics(InverseKinematicsCfg.create(robot=rc_arm, scene_model=[self.scene_dict((0, 0, 0))] * self.E,
-                     collision_cache=cache, num_seeds=P["scorer_seeds"], self_collision_check=True, max_batch_size=self.E, multi_env=True))
-        d_ = self.ik_rob.scene_collision_checker.data
-        self.cub = getattr(d_, "cuboid", None) or getattr(d_, "cuboids")
+        self.ik_rob = InverseKinematics(InverseKinematicsCfg.create(robot=rc_arm, scene_model=[empty] * self.E,
+                     collision_cache=near_cache, num_seeds=P["scorer_seeds"], self_collision_check=True, max_batch_size=self.E, multi_env=True))
+        self.ik_rob.config.exit_early = False                   # solve_envs checks the LM seeds itself (see there)
+        self.cub = self._cuboids(self.ik_rob)
         # 4. arm-only motion planner
-        self.planner = MotionPlanner(MotionPlannerCfg.create(robot=rc_arm, scene_model=self.scene_at((0, 0, 0)),
-                     collision_cache=cache, use_cuda_graph=False,
+        self.planner = MotionPlanner(MotionPlannerCfg.create(robot=rc_arm, scene_model=empty,
+                     collision_cache=near_cache, use_cuda_graph=False,
                      num_ik_seeds=P["planner_ik_seeds"], num_trajopt_seeds=P["planner_trajopt_seeds"]))
         self.planner.warmup(enable_graph=True, num_warmup_iterations=1)
         self.base_sph = np.array([[*k['center'], k['radius']] for k in kachaka_spheres(cfg)])   # 2. parking check: the base only
@@ -88,12 +101,47 @@ class BasePlacementPlanner:
         for j, v in zip(ARM_JOINTS, self.stow):                 # the arm trajectory starts from the stowed arm
             flat[names.index(j)] = float(v)
         self.start = start.unsqueeze(0)
+        self.write_boxes(self.cub_wb, np.zeros((1, 3)), near=False)
         for _ in range(2):                                      # warm-up (CUDA graphs)
             self.ik_wb.solve_pose(self.goal_from(np.zeros((1, 3))), return_seeds=P["wb_seeds"])
         self.robustness(np.zeros((self.group, 3)))
+        if scene is not None:
+            self.set_scene(scene)
         _sync(); self.T["setup_s"] = time.perf_counter() - t0
         self.MEM["resident_after_setup"] = torch.cuda.memory_allocated() / 2**20
         self.MEM["setup_peak"] = torch.cuda.max_memory_allocated() / 2**20
+
+    @staticmethod
+    def _cuboids(solver):
+        d_ = solver.scene_collision_checker.data
+        return getattr(d_, "cuboid", None) or getattr(d_, "cuboids")
+
+    def _take_scene(self, scene):
+        """Gripper pose, search window and obstacle arrays (base frame) of one request; no GPU work. Without a scene:
+        nothing to avoid and a gripper pose in front of the robot, enough for the warm-up."""
+        self.scene = scene
+        self.gpos = np.array(scene.grasp_pos_base if scene else (0.5, 0.0, 0.7), float)   # decided gripper pose — fixed
+        self.gquat = np.array(scene.grasp_quat_base if scene else (1.0, 0.0, 0.0, 0.0), float)
+        S = self.cfg["search"]
+        self.window = self._window() if scene else {"x": list(S["window_x"]), "y": list(S["window_y"])}
+        # only the boxes some base pose in the search window (± navigation error) can touch
+        B = [b for b in (scene.boxes_base if scene else []) if self._window_gap(b) < self.reach + math.hypot(*self.pivot[:2]) + self.d]
+        self.names = [b["name"] for b in B]
+        self.C = np.array([b["center"] for b in B], float).reshape(-1, 3); self.D = np.array([b["dims"] for b in B], float).reshape(-1, 3)
+        self.Y = np.array([b.get("yaw", 0.0) for b in B], float)
+        self.T["boxes_used"] = float(len(B))
+
+    def set_scene(self, scene):
+        """Next request: its obstacles go straight into the solvers' collision tensors; nothing is rebuilt."""
+        t = time.perf_counter()
+        self._take_scene(scene)
+        if len(self.names) > self.cub_wb.max_n:
+            raise ValueError(f"{len(self.names)} boxes in the search window, profile.max_scene_boxes is {self.cub_wb.max_n}")
+        # a loose upper bound (any yaw, 5 cm grid); the exact count per station is checked in write_boxes(), which refuses
+        # rather than drop a box, so this is only reported
+        self.T["near_bound"] = float(self._near_bound(self.d))
+        self.write_boxes(self.cub_wb, np.zeros((1, 3)), near=False)
+        self.T["set_scene_s"] = time.perf_counter() - t
 
     # ------------------------------------------------------------ geometry helpers
     def _window(self):
@@ -102,21 +150,96 @@ class BasePlacementPlanner:
         x0, x1, y0, y1 = self.scene.known.bbox_base()           # never search outside the area the SLAM has seen
         return {"x": [max(wx[0], x0), min(wx[1], x1)], "y": [max(wy[0], y0), min(wy[1], y1)]}
 
+    def _window_gap(self, b):
+        """Lower bound of the horizontal distance from box b to the search window (≤ 0 when they overlap)."""
+        (x0, x1), (y0, y1) = self.window["x"], self.window["y"]
+        cx, cy = b["center"][:2]
+        return math.hypot(max(x0 - cx, 0, cx - x1), max(y0 - cy, 0, cy - y1)) - math.hypot(*b["dims"][:2]) / 2
+
+    def _box_dist(self, p):
+        """Distance from points p (M, 3) to every box → (M, n_boxes); negative inside."""
+        c, s = np.cos(self.Y), np.sin(self.Y)
+        dx, dy = p[:, None, 0] - self.C[None, :, 0], p[:, None, 1] - self.C[None, :, 1]
+        q = np.abs(np.stack([c * dx + s * dy, -s * dx + c * dy, p[:, None, 2] - self.C[None, :, 2]], -1)) - self.D / 2
+        return np.linalg.norm(np.maximum(q, 0), axis=-1) + np.minimum(q.max(-1), 0)
+
+    def _near(self, F):
+        """(len(F), n_boxes): which boxes the robot can touch, in any arm pose, with its base standing at each row of F."""
+        F = np.atleast_2d(F); c, s = np.cos(F[:, 2]), np.sin(F[:, 2]); px, py, pz = self.pivot
+        return self._box_dist(np.c_[F[:, 0] + c * px - s * py, F[:, 1] + s * px + c * py, np.full(len(F), pz)]) < self.reach
+
+    def _near_bound(self, d):
+        """Most boxes one station can touch (sizes the collision cache; never decides which boxes count): a 5 cm grid over
+        the base poses robustness() and plan_arm() can see — stations (the gripper reaches the target, so the base is
+        within tool_reach + |pivot_xy| of it) and the warm-up at the origin, ± navigation error d. Each grid point counts
+        the boxes within reach of any shoulder position around it (the shoulder is |pivot_xy| from the base centre,
+        a base at most h/√2 from its nearest grid point)."""
+        if not np.isfinite(self.reach) or not len(self.names):
+            return len(self.names)
+        h = 0.05; (x0, x1), (y0, y1) = self.window["x"], self.window["y"]; pxy = math.hypot(*self.pivot[:2])
+        G = np.stack(np.meshgrid(np.arange(min(x0, 0) - d, max(x1, 0) + d + h, h),
+                                 np.arange(min(y0, 0) - d, max(y1, 0) + d + h, h)), -1).reshape(-1, 2)
+        slack = d * math.sqrt(2) + h
+        G = G[((np.hypot(*(G - self.gpos[:2]).T) <= self.tool_reach + IK_POS_TOL_M + pxy + slack) & self._parkable_near(G, slack))
+              | (np.hypot(*G.T) <= slack)]
+        r = self.reach + pxy + h / math.sqrt(2)
+        return max(int((self._box_dist(np.c_[g, np.full(len(g), self.pivot[2])]) < r).sum(1).max())
+                   for g in np.array_split(G, max(1, len(G) // 256)))
+
+    def _parkable_near(self, G, slack):
+        """Base positions G (M, 2) close enough to a drivable cell that a station within `slack` of them could park:
+        parking_ok() needs the body centre (|body_center_xy| from the base origin) on a known cell."""
+        K = self.scene.known
+        if getattr(K, "_edt", None) is None:
+            from scipy.ndimage import distance_transform_edt
+            K._edt = distance_transform_edt(~K.known) * K.resolution            # distance to the nearest known cell
+        ij = np.floor((base_to_map_xy(G, K.base_pose_in_map) - K.origin_xy) / K.resolution + 0.5).astype(int)
+        H, W = K.known.shape
+        inside = (ij[:, 0] >= 0) & (ij[:, 0] < W) & (ij[:, 1] >= 0) & (ij[:, 1] < H)
+        dist = np.full(len(G), np.inf); dist[inside] = K._edt[ij[inside, 1], ij[inside, 0]]
+        body = math.hypot(*self.cfg["robot"]["kachaka"].get("body_center_xy", [0.0, 0.0]))
+        return dist <= body + slack + K.resolution * math.sqrt(2)
+
     def _in_frame(self, f):
         """Obstacle centres / yaws expressed in the frame of a base standing at f = (x, y, yaw)."""
         bx, by, bt = f; c, s = math.cos(-bt), math.sin(-bt)
         dx, dy = self.C[:, 0] - bx, self.C[:, 1] - by
         return np.c_[c * dx - s * dy, s * dx + c * dy, self.C[:, 2]], self.Y - bt
 
-    def scene_at(self, f):
-        cen, yaw = self._in_frame(f)
+    def scene_at(self, f, near=False):
+        cen, yaw = self._in_frame(f); keep = self._near(f)[0] if near else np.ones(len(self.names), bool)
         return Scene(cuboid=[Cuboid(name=n, dims=list(d), pose=[*c, math.cos(y / 2), 0, 0, math.sin(y / 2)])
-                             for n, c, d, y in zip(self.names, cen, self.D, yaw)])
+                             for n, c, d, y, k in zip(self.names, cen, self.D, yaw, keep) if k])
 
-    def scene_dict(self, f):
-        cen, yaw = self._in_frame(f)
+    def scene_dict(self, f, near=False):
+        cen, yaw = self._in_frame(f); keep = self._near(f)[0] if near else np.ones(len(self.names), bool)
         return {"cuboid": {n: {"dims": list(map(float, d)), "pose": [*map(float, c), math.cos(y / 2), 0, 0, math.sin(y / 2)]}
-                           for n, c, d, y in zip(self.names, cen, self.D, yaw)}}
+                           for n, c, d, y, k in zip(self.names, cen, self.D, yaw, keep) if k}}
+
+    def load_envs(self, envf):
+        """Obstacles of every robustness environment (base standing at envf[e] = (x, y, yaw)): only the boxes within reach."""
+        self.write_boxes(self.cub, envf)
+
+    def write_boxes(self, cub, envf, near=True):
+        """Obstacles of every environment of a solver (base standing at envf[e] = (x, y, yaw)) written straight into its
+        collision tensors, packed to the front, inverse pose in closed form. near: only the boxes within reach."""
+        near = self._near(envf) if near else np.ones((len(envf), len(self.names)), bool); n = near.sum(1)
+        if n.max(initial=0) > cub.max_n:
+            raise RuntimeError(f"{n.max()} boxes for one environment, the collision cache holds {cub.max_n}")
+        idx = np.argsort(~near, axis=1, kind="stable")[:, :cub.max_n]; K = idx.shape[1]   # kept boxes first, scene order
+        # obstacle-from-base pose for every env: R = Rz(psi - yaw_o), t = Rz(-yaw_o) (b - c_o)
+        C, Y = self.C[idx], self.Y[idx]
+        cy, sy = np.cos(-Y), np.sin(-Y)
+        dx = envf[:, None, 0] - C[..., 0]; dy = envf[:, None, 1] - C[..., 1]
+        inv = np.zeros(idx.shape + (7,), np.float32)
+        inv[..., 0] = cy * dx - sy * dy; inv[..., 1] = sy * dx + cy * dy; inv[..., 2] = -C[..., 2]
+        ang = envf[:, None, 2] - Y
+        inv[..., 3] = np.cos(ang / 2); inv[..., 6] = np.sin(ang / 2)
+        dev = cub.inv_pose.device
+        cub.inv_pose[:, :K, :7] = torch.from_numpy(inv).to(dev)
+        cub.dims[:, :K, :3] = torch.from_numpy(self.D[idx].astype(np.float32)).to(dev)
+        cub.enable[:, :K] = torch.from_numpy((np.arange(K)[None] < n[:, None]).astype(np.uint8)).to(dev)
+        cub.count[:] = torch.from_numpy(n.astype(np.int32)).to(dev)
 
     def goal_from(self, F):
         """The decided gripper pose, expressed in the frame of a base standing at each row of F = [(x, y, yaw)]."""
@@ -135,7 +258,9 @@ class BasePlacementPlanner:
         jn = list(r.js_solution.joint_names)
         q = r.js_solution.position.reshape(-1, len(jn)).cpu().numpy()
         ok = r.success.reshape(-1).cpu().numpy().astype(bool)
-        return q[ok][:, [jn.index(j) for j in BASE_JOINTS + ARM_JOINTS]]
+        q = q[ok][:, [jn.index(j) for j in BASE_JOINTS + ARM_JOINTS]]
+        (x0, x1), (y0, y1) = self.window["x"], self.window["y"]  # a long-running planner's joint limits are the config
+        return q[(q[:, 0] >= x0) & (q[:, 0] <= x1) & (q[:, 1] >= y0) & (q[:, 1] <= y1)]   # window; this request's is smaller
 
     # ------------------------------------------------------------ step 2
     def parking_ok(self, bases):
@@ -162,26 +287,40 @@ class BasePlacementPlanner:
     # ------------------------------------------------------------ step 3
     def robustness(self, bases):
         """Fraction of the 27 perturbed base poses from which the arm still reaches the decided gripper pose (and the
-        target stays in the safety cone). All (candidate, perturbation) problems go into ONE multi-env IK call; every
-        environment's obstacles are written straight into the collision tensor (closed-form inverse pose)."""
+        target stays in the safety cone). All (candidate, perturbation) problems go into ONE multi-env IK call; each
+        environment only holds the boxes within reach of its base (load_envs)."""
         bases = np.atleast_2d(bases)[:, :3]; n = len(bases)
         fr = (bases[:, None, :] + self.OFFS[None]).reshape(-1, 3)
         envf = np.vstack([fr, np.repeat(fr[-1:], self.E - len(fr), 0)]) if len(fr) < self.E else fr
-        # obstacle-from-base pose for every env: R = Rz(psi - yaw_o), t = Rz(-yaw_o) (b - c_o)
-        cy, sy = np.cos(-self.Y)[None], np.sin(-self.Y)[None]
-        dx = envf[:, None, 0] - self.C[None, :, 0]; dy = envf[:, None, 1] - self.C[None, :, 1]
-        inv = np.zeros((self.E, len(self.names), 7), np.float32)
-        inv[:, :, 0] = cy * dx - sy * dy; inv[:, :, 1] = sy * dx + cy * dy; inv[:, :, 2] = -self.C[None, :, 2]
-        ang = envf[:, None, 2] - self.Y[None]
-        inv[:, :, 3] = np.cos(ang / 2); inv[:, :, 6] = np.sin(ang / 2)
-        self.cub.inv_pose[:, :len(self.names), :7] = torch.from_numpy(inv).to(self.cub.inv_pose.device)
-        r = self.ik_rob.solve_pose(self.goal_from(envf))
-        ok = r.success.reshape(self.E, -1).any(dim=1).cpu().numpy()[:len(fr)]
+        self.load_envs(envf)
+        ok = self.solve_envs(self.goal_from(envf))[:len(fr)]
         return (ok & in_safety_cone(self.cfg, fr, self.gpos[:2])).reshape(n, len(self.OFFS)).mean(axis=1)
+
+    def solve_envs(self, goal, warm=None):
+        """Can the arm reach `goal` in each robustness environment? (bool per env)
+        cuRobo's IK first runs Levenberg-Marquardt on random starts (pose only), then MPPI + L-BFGS with collisions from
+        those seeds. Measured on real maps, that second stage turns many LM seeds that were ALREADY valid (collision-free,
+        within limits, on the pose) into failures — more so with more seeds and later in the batch — while it rescues
+        others. Both are checked by the same metrics, so an env counts as reachable if either the LM seeds or the
+        optimised seeds contain a valid solution; the optimiser only runs when some env is still unsolved.
+        warm (E, dof): a known arm solution per env, put in place of the first seed."""
+        ik, ns = self.ik_rob, self.cfg["profile"]["scorer_seeds"]
+        g = goal.reorder_links(ik.kinematics.tool_frames)
+        seeds = ik.seed_ik_solver.solve_batch(goal_tool_poses=g, return_seeds=ns).js_solution.position.view(self.E, ns, -1).clone()
+        if warm is not None:
+            seeds[:, 0] = warm
+        lm = ik.config.use_lm_seed; ik.config.use_lm_seed = False            # seeds given: do not redo LM
+        try:
+            ok = ik.solve_pose(goal, seed_config=seeds, return_seeds=ns, run_optimizer=False).success.reshape(self.E, -1).any(dim=1)
+            if not bool(ok.all()):
+                ok |= ik.solve_pose(goal, seed_config=seeds, return_seeds=ns).success.reshape(self.E, -1).any(dim=1)
+        finally:
+            ik.config.use_lm_seed = lm
+        return ok.cpu().numpy()
 
     # ------------------------------------------------------------ step 4
     def plan_arm(self, base):
-        self.planner.update_world(self.scene_at(base))
+        self.planner.update_world(self.scene_at(base, near=True))
         pr = self.planner.plan_pose(self.goal_from(np.asarray([base], float)), self.start, max_attempts=5)
         if pr is None or not bool(pr.success.any()):
             return None

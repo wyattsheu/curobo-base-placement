@@ -10,6 +10,9 @@
 | `run_scenarios.py` | 測試場景改掉一個條件，確認每一種 `reason` 都在該出現的地方出現（8 個場景，印 PASS / FAIL） | 上層 README 第 8 節 |
 | `bench_multi_grasp.py` | 上游給多個夾爪位姿時的耗時：`sweep` 評分種子數／批次大小、`warm` warm start、`e2e` 20 個夾爪位姿從頭到尾 | 上層 README 第 9 節（待補） |
 | `bench_lab_maps.py` | 在實驗室的真實 SLAM 地圖上，少量種子選出的站位是否和 32 種子的基準一樣好 | 上層 README 第 9 節（待補） |
+| `bench_near.py` | 同一批站位：全部方塊 vs 只放手臂碰得到的方塊，分數差與時間 | 上層 README 第 9 節 |
+| `check_near_exact.py` | 用 cuRobo FK 確認被拿掉的方塊不可能進入碰撞啟動距離 | 上層 README 第 9 節 |
+| `bench_seeds.py` | 評分種子數／warm start 對 32 種子基準的 regret 與時間 | 上層 README 第 9 節 |
 
 ```bash
 python validation/run_scenarios.py                        # 全部場景
