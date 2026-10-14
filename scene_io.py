@@ -327,6 +327,19 @@ def load_occupancy(yaml_path):
     return free, r, (ox + r / 2, oy + r / 2)
 
 
+def window_reach_mask(xy_map, base_pose_in_map, cfg):
+    """Points (map frame) some part of the robot could touch from a base pose inside the search window (± navigation
+    error): within the arm's reach bound (robot_model.arm_reach) + the shoulder's offset + crop_margin_m of the window.
+    Anything farther can never matter to the planner, so it is dropped before the (slow) box fitting."""
+    from robot_model import arm_reach
+    pivot, reach, _ = arm_reach(cfg)
+    S = cfg["search"]; b = map_to_base_xy(xy_map, base_pose_in_map)
+    gx = np.maximum.reduce([S["window_x"][0] - b[:, 0], np.zeros(len(b)), b[:, 0] - S["window_x"][1]])
+    gy = np.maximum.reduce([S["window_y"][0] - b[:, 1], np.zeros(len(b)), b[:, 1] - S["window_y"][1]])
+    lim = reach + math.hypot(*pivot[:2]) + cfg["robustness"]["perturb_xy_m"] * math.sqrt(2) + cfg["map"].get("crop_margin_m", 0.1)
+    return np.hypot(gx, gy) <= lim
+
+
 def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, target=None, class_names=None,
                     ignore_classes=("floor",), occupancy=None):
     """3D semantic SLAM map + decided grasp → PlanningScene (base frame).
@@ -401,6 +414,8 @@ def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, t
             is_tgt[np.nonzero(cand)[0][np.isfinite(d_t)]] = True
     # obstacles: everything above the floor within roi_radius_m of the grasp point, except the target and ignored classes
     obst = ~low & ~is_tgt & ~np.isin(sem, ign) & (np.linalg.norm(P[:, :2] - g[:2], axis=1) <= M["roi_radius_m"])
+    if M.get("crop_to_window", False):
+        obst &= window_reach_mask(P[:, :2], base_pose_in_map, cfg)
     boxes = objects_to_boxes(P[obst], sem[obst], v, M["min_voxels"], M["box_xy_margin_m"], M["box_z_margin_m"],
                              fill=M.get("box_fill", 0.7), max_empty_m2=M.get("box_max_empty_m2", 0.04), level_gap=M.get("level_gap_m", 0.06),
                              level_min_cells=M.get("level_min_cells", 8),

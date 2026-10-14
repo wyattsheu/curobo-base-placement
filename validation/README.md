@@ -14,6 +14,7 @@
 | `bench_near.py` | 同一批站位：全部方塊 vs 只放手臂碰得到的方塊，分數差與時間 | 上層 README 第 9 節 |
 | `check_near_exact.py` | 用 cuRobo FK 確認被拿掉的方塊不可能進入碰撞啟動距離 | 上層 README 第 9 節 |
 | `bench_seeds.py` | 評分種子數／warm start 對 32 種子基準的 regret 與時間 | 上層 README 第 9 節 |
+| `bench_roi.py` | 縮小搜尋視窗 + 把地圖裁到手臂碰得到的範圍：建場景時間、有沒有解、選到的站位 | 上層 README 第 9 節 |
 
 ```bash
 python validation/run_scenarios.py                        # 全部場景
