@@ -15,6 +15,7 @@ Everything is in the base frame (Kachaka now). result["chosen_map"] is the goal 
 """
 import math
 import time
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -88,6 +89,12 @@ class BasePlacementPlanner:
                      collision_cache=near_cache, num_seeds=P["scorer_seeds"], self_collision_check=True, max_batch_size=self.E, multi_env=True))
         self.ik_rob.config.exit_early = False                   # solve_envs checks the LM seeds itself (see there)
         self.cub = self._cuboids(self.ik_rob)
+        # the optimiser's own, smaller batch: only the perturbations LM left unsolved go through it (lazy_optimiser)
+        self.Eo = min(self.E, P.get("optimiser_batch", len(self.OFFS)))
+        self.ik_opt = InverseKinematics(InverseKinematicsCfg.create(robot=rc_arm, scene_model=[empty] * self.Eo,
+                     collision_cache=near_cache, num_seeds=P["scorer_seeds"], self_collision_check=True, max_batch_size=self.Eo, multi_env=True))
+        self.ik_opt.config.exit_early = False; self.ik_opt.config.use_lm_seed = False
+        self.cub_opt = self._cuboids(self.ik_opt)
         # 4. arm-only motion planner
         self.planner = MotionPlanner(MotionPlannerCfg.create(robot=rc_arm, scene_model=empty,
                      collision_cache=near_cache, use_cuda_graph=True,
@@ -105,6 +112,9 @@ class BasePlacementPlanner:
         for _ in range(2):                                      # warm-up (CUDA graphs)
             self.ik_wb.solve_pose(self.goal_from(np.zeros((1, 3))), return_seeds=P["wb_seeds"])
         self.robustness(np.zeros((self.group, 3)))
+        envo = np.zeros((self.Eo, 3)); self.write_boxes(self.cub_opt, envo)
+        _, sd = self._lm_envs(self.goal_from(np.zeros((self.E, 3))))
+        self._opt_envs(self.goal_from(envo), sd[:self.Eo], self.ik_opt)
         if scene is not None:
             self.set_scene(scene)
         _sync(); self.T["setup_s"] = time.perf_counter() - t0
@@ -306,20 +316,73 @@ class BasePlacementPlanner:
         optimised seeds contain a valid solution; the optimiser only runs when some env is still unsolved.
         warm (E, dof): a known arm solution per env, put in place of the first seed.
         care (E,) bool: envs whose answer matters (e.g. inside the safety cone); the others never trigger the optimiser."""
+        ok, seeds = self._lm_envs(goal, warm)
+        need = ~ok if care is None else ~ok & np.asarray(care, bool)
+        if need.any():
+            ok |= self._opt_envs(goal, seeds)
+        return ok
+
+    def _lm_envs(self, goal, warm=None):
+        """Stage 1 only: LM seeds per env and whether any of them is already a valid solution. → (ok (E,), seeds)"""
         ik, ns = self.ik_rob, self.cfg["profile"]["scorer_seeds"]
         g = goal.reorder_links(ik.kinematics.tool_frames)
         seeds = ik.seed_ik_solver.solve_batch(goal_tool_poses=g, return_seeds=ns).js_solution.position.view(self.E, ns, -1).clone()
         if warm is not None:
             seeds[:, 0] = warm
-        lm = ik.config.use_lm_seed; ik.config.use_lm_seed = False            # seeds given: do not redo LM
+        with self._seeds_given():
+            r = ik.solve_pose(goal, seed_config=seeds, return_seeds=ns, run_optimizer=False)
+        return r.success.reshape(self.E, -1).any(dim=1).cpu().numpy(), seeds
+
+    def _opt_envs(self, goal, seeds, ik=None):
+        """Stage 2: MPPI + L-BFGS from the given seeds (batch, seeds, dof). → ok (batch,)"""
+        ik = ik or self.ik_rob
+        with self._seeds_given():
+            r = ik.solve_pose(goal, seed_config=seeds, return_seeds=self.cfg["profile"]["scorer_seeds"])
+        return r.success.reshape(len(seeds), -1).any(dim=1).cpu().numpy()
+
+    @contextmanager
+    def _seeds_given(self):
+        ik = self.ik_rob; lm = ik.config.use_lm_seed; ik.config.use_lm_seed = False   # seeds given: do not redo LM
         try:
-            ok = ik.solve_pose(goal, seed_config=seeds, return_seeds=ns, run_optimizer=False).success.reshape(self.E, -1).any(dim=1)
-            need = ~ok if care is None else ~ok & torch.as_tensor(care, device=ok.device)
-            if bool(need.any()):
-                ok |= ik.solve_pose(goal, seed_config=seeds, return_seeds=ns).success.reshape(self.E, -1).any(dim=1)
+            yield
         finally:
             ik.config.use_lm_seed = lm
-        return ok.cpu().numpy()
+
+    # ------------------------------------------------------------ step 3, optimiser only where it can change the answer
+    def _lm_pass(self, U, order):
+        """Every candidate scored with LM seeds only (stage 1 is ~1% of the cost), `group` stations per call. Per
+        station: frames, safety cone, LM verdict, seeds, and which perturbations still need the optimiser."""
+        K, S = len(self.OFFS), {}
+        for g0 in range(0, len(order), self.group):
+            idx = order[g0:g0 + self.group]
+            fr = (U[idx, None, :3] + self.OFFS[None]).reshape(-1, 3)
+            envf = np.vstack([fr, np.repeat(fr[-1:], self.E - len(fr), 0)]) if len(fr) < self.E else fr
+            self.load_envs(envf)
+            ok, seeds = self._lm_envs(self.goal_from(envf))
+            cone = in_safety_cone(self.cfg, envf, self.gpos[:2])
+            for a, j in enumerate(idx):
+                e = slice(a * K, (a + 1) * K)
+                S[j] = {"frames": fr[e], "ok": ok[e] & cone[e], "todo": ~ok[e] & cone[e], "seeds": seeds[e]}
+        return S
+
+    def _finish(self, S, order, j):
+        """Station j's final score needs the optimiser for the perturbations LM left unsolved (outside the safety cone
+        they fail anyway). Only those go in, packed with the next unfinished stations' until one call is full."""
+        if not S[j]["todo"].any():
+            return
+        slots, B = [], self.Eo
+        for i in order[order.index(j):]:
+            slots += [(i, e) for e in np.nonzero(S[i]["todo"])[0]][:B - len(slots)]
+            if len(slots) == B:
+                break
+        fr = np.array([S[i]["frames"][e] for i, e in slots])
+        envf = np.vstack([fr, np.repeat(fr[-1:], B - len(fr), 0)])
+        seeds = torch.stack([S[i]["seeds"][e] for i, e in slots])
+        seeds = torch.cat([seeds, seeds[-1:].expand(B - len(slots), -1, -1)])
+        self.write_boxes(self.cub_opt, envf)
+        ok = self._opt_envs(self.goal_from(envf), seeds, self.ik_opt)
+        for (i, e), o in zip(slots, ok):
+            S[i]["ok"][e] |= bool(o); S[i]["todo"][e] = False
 
     # ------------------------------------------------------------ step 4
     def plan_arm(self, base):
@@ -364,19 +427,33 @@ class BasePlacementPlanner:
         order = [int(j) for j in np.argsort(dist) if park[j]]
         # 3.+4. nearest first: robustness, then plan the first one that passes
         checked, tried, best, arm = {}, [], None, None
-        for g0 in range(0, len(order), self.group):
-            idx = np.array(order[g0:g0 + self.group])
-            rob = self._timed("scoring_s", self.robustness, U[idx, :3])
-            checked.update(zip(idx.tolist(), rob.tolist()))
-            for j, rj in zip(idx.tolist(), rob.tolist()):
+        if P.get("lazy_optimiser", True):
+            # the same nearest-first rule, but the optimiser only runs where it can change the answer: LM scores every
+            # candidate first; a station's unsolved perturbations are optimised when its final score is needed
+            S = self._timed("scoring_s", self._lm_pass, U, order)
+            for j in order:
+                self._timed("scoring_s", self._finish, S, order, j)
+                checked[j] = rj = float(S[j]["ok"].mean())
                 if rj < th - 1e-9:
                     continue
                 arm = self._timed("arm_plan_s", self.plan_arm, tuple(U[j, :3]))
                 tried.append({"idx": j, "ok": arm is not None, "robustness": rj})
                 if arm is not None:
                     best = j; break
-            if best is not None:
-                break
+        else:                                                        # previous way: whole groups through the optimiser
+            for g0 in range(0, len(order), self.group):
+                idx = np.array(order[g0:g0 + self.group])
+                rob = self._timed("scoring_s", self.robustness, U[idx, :3])
+                checked.update(zip(idx.tolist(), rob.tolist()))
+                for j, rj in zip(idx.tolist(), rob.tolist()):
+                    if rj < th - 1e-9:
+                        continue
+                    arm = self._timed("arm_plan_s", self.plan_arm, tuple(U[j, :3]))
+                    tried.append({"idx": j, "ok": arm is not None, "robustness": rj})
+                    if arm is not None:
+                        best = j; break
+                if best is not None:
+                    break
         below = False
         if best is None:                     # nobody reached the threshold: try the most robust ones, and say so
             done = {t["idx"] for t in tried}

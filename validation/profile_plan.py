@@ -65,7 +65,7 @@ def instrument(pl, prof):
         bases = np.atleast_2d(bases)[:, :3]; n = len(bases); K = len(pl.OFFS)
         fr = (bases[:, None, :] + pl.OFFS[None]).reshape(-1, 3)
         envf = np.vstack([fr, np.repeat(fr[-1:], pl.E - len(fr), 0)]) if len(fr) < pl.E else fr
-        prof.timed("load_envs", pl.load_envs, envf)
+        pl.load_envs(envf)
         cone = in_safety_cone(pl.cfg, envf, pl.gpos[:2])
         ok = solve_envs(pl.goal_from(envf), care=cone)[:len(fr)]
         lm_ok = prof._lm_ok[:len(fr)]
@@ -77,6 +77,10 @@ def instrument(pl, prof):
 
     pl.solve_envs = solve_envs
     pl.robustness = robustness
+    lm_envs, opt_envs, load = pl._lm_envs, pl._opt_envs, pl.load_envs            # the lazy path (profile.lazy_optimiser)
+    pl._lm_envs = lambda *a, **k: prof.timed("lm_solve", lm_envs, *a, **k)
+    pl._opt_envs = lambda *a, **k: prof.timed("optimiser", opt_envs, *a, **k)
+    pl.load_envs = lambda *a, **k: prof.timed("load_envs", load, *a, **k)
 
 
 def main(root, sites):
