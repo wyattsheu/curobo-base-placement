@@ -235,7 +235,7 @@ def height_levels(top, foot, gap, min_cells):
 
 
 def objects_to_boxes(P, sem, v, min_vox, xy_margin, z_margin, fill=0.7, level_gap=0.06, level_min_cells=8, max_empty_m2=0.04,
-                     keep_out=None):
+                     keep_out=None, workers=0):
     """Points (+ optional semantic ids) → obstacle boxes. Per class, 3D-connected voxel clusters (≥ min_vox voxels) are
     objects; without semantic ids everything is one class, so touching things (a board on a table, a cabinet next to
     it) become ONE object. Each object is therefore also split by height: every footprint cell gets the height of its
@@ -245,9 +245,11 @@ def objects_to_boxes(P, sem, v, min_vox, xy_margin, z_margin, fill=0.7, level_ga
     Boxes lie on the object's own orientation and take the tight extent of its points (+ margin).
     keep_out = (xy (M, 2), z_bottom): the target's footprint. Filling holes in an object's outline would otherwise
     close the gap the target's (removed) points leave, e.g. a bottle standing right in front of a box; layers whose
-    top is above z_bottom skip those cells, layers below (the table under the bottle) are kept."""
+    top is above z_bottom skip those cells, layers below (the table under the bottle) are kept.
+    Objects are independent: with workers > 1 they are boxed in parallel processes (a pool kept for the process's
+    lifetime); the boxes and their names come out in the same order either way."""
     from scipy import ndimage
-    out = []
+    jobs = []
     for c in np.unique(sem):
         Pc = P[sem == c]
         if len(Pc) < min_vox:
@@ -257,49 +259,78 @@ def objects_to_boxes(P, sem, v, min_vox, xy_margin, z_margin, fill=0.7, level_ga
         grid = np.zeros(ijk.max(0)[::-1] + 1, bool); grid[ijk[:, 2], ijk[:, 1], ijk[:, 0]] = True
         lab, n = ndimage.label(grid, structure=np.ones((3, 3, 3)))
         pl = lab[ijk[:, 2], ijk[:, 1], ijk[:, 0]]
-        for obj in range(1, n + 1):
-            if (lab == obj).sum() < min_vox:
-                continue                                                        # speck of noise
-            Po = Pc[pl == obj]
-            t = dominant_angle(Po[:, :2]) if len(Po) > 20 else 0.0
-            Pr = np.c_[_rot_xy(Po[:, :2], -t), Po[:, 2]]
-            lo = Pr[:, :2].min(0) - v / 2
-            ij = np.floor((Pr[:, :2] - lo) / v).astype(int)
-            seen = np.zeros(ij.max(0)[::-1] + 1, bool); seen[ij[:, 1], ij[:, 0]] = True
-            foot = ndimage.binary_fill_holes(_close(seen, 1))                  # points only lie on surfaces
-            top = np.full(seen.shape, -np.inf); np.maximum.at(top, (ij[:, 1], ij[:, 0]), Pr[:, 2])
-            near = ndimage.distance_transform_edt(~seen, return_distances=False, return_indices=True)
-            top = top[near[0], near[1]]                                         # filled-in cells: nearest seen cell
-            levels = height_levels(top, foot, level_gap, level_min_cells)
-            ko = None
-            if keep_out is not None and len(keep_out[0]):                     # the target's footprint, this object's grid
-                kij = np.floor((_rot_xy(keep_out[0], -t) - lo) / v).astype(int)
-                ok = (kij[:, 0] >= 0) & (kij[:, 0] < foot.shape[1]) & (kij[:, 1] >= 0) & (kij[:, 1] < foot.shape[0])
-                if ok.any():
-                    ko = np.zeros(foot.shape, bool); ko[kij[ok, 1], kij[ok, 0]] = True; ko = _dilate(ko, 1)
-            z_floor = None
-            for k, (h_lo, h_hi, surf) in enumerate(levels):
-                mask = foot & (top >= h_lo - 1e-9)
-                if ko is not None and surf > keep_out[1]:                       # a layer reaching above the target's
-                    mask &= ~ko                                                 # bottom never fills the target's place
-                for a, b in decompose(mask, fill=fill, max_empty=max_empty_m2 / v ** 2):
-                    x0, y0 = lo + a[::-1] * v; x1, y1 = lo + (b[::-1] + 1) * v
-                    m = (Pr[:, 0] >= x0) & (Pr[:, 0] <= x1) & (Pr[:, 1] >= y0) & (Pr[:, 1] <= y1) & (Pr[:, 2] <= h_hi + 1e-9)
-                    if k > 0:
-                        m &= Pr[:, 2] > z_floor                                 # only this level's points set its extent
-                    if not m.any():
-                        continue
-                    lo_q, hi_q = np.percentile(Pr[m], [0.5, 99.5], axis=0)      # robust to single noisy points
-                    x0, y0 = max(x0, lo_q[0] - xy_margin), max(y0, lo_q[1] - xy_margin)
-                    x1, y1 = min(x1, hi_q[0] + xy_margin), min(y1, hi_q[1] + xy_margin)
-                    z0 = lo_q[2] - z_margin if k == 0 else z_floor               # stacked on the level below
-                    z1 = (hi_q[2] if len(levels) == 1 else surf) + z_margin       # one level: as tight as its points
-                    if z1 <= z0:
-                        continue
-                    cxy = _rot_xy(np.array([[(x0 + x1) / 2, (y0 + y1) / 2]]), t)[0]
-                    out.append({"name": f"c{c}_o{obj}_{len(out)}", "center": [float(cxy[0]), float(cxy[1]), float((z0 + z1) / 2)],
-                                "dims": [float(x1 - x0), float(y1 - y0), float(z1 - z0)], "yaw": float(t)})
-                z_floor = (hi_q[2] if len(levels) == 1 else surf) + z_margin
+        counts = np.bincount(lab.ravel(), minlength=n + 1)
+        jobs += [(c, obj, Pc[pl == obj]) for obj in range(1, n + 1) if counts[obj] >= min_vox]   # fewer: noise
+    args = (v, xy_margin, z_margin, fill, level_gap, level_min_cells, max_empty_m2, keep_out)
+    if workers > 1 and len(jobs) > 1:                                           # biggest objects first, results in order
+        pool = _box_pool(workers)
+        futs = {k: pool.submit(_object_boxes, jobs[k][2], *args) for k in sorted(range(len(jobs)), key=lambda k: -len(jobs[k][2]))}
+        results = [futs[k].result() for k in range(len(jobs))]
+    else:
+        results = [_object_boxes(Po, *args) for _, _, Po in jobs]
+    out = []
+    for (c, obj, _), boxes in zip(jobs, results):
+        for cen, dims, yaw in boxes:
+            out.append({"name": f"c{c}_o{obj}_{len(out)}", "center": cen, "dims": dims, "yaw": yaw})
+    return out
+
+
+_POOLS = {}
+
+
+def _box_pool(workers):
+    """Process pool for objects_to_boxes, made once per process; spawned, so no CUDA or thread state is inherited."""
+    if workers not in _POOLS:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        import atexit
+        _POOLS[workers] = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"))
+        atexit.register(_POOLS[workers].shutdown)                               # before the interpreter tears down
+    return _POOLS[workers]
+
+
+def _object_boxes(Po, v, xy_margin, z_margin, fill, level_gap, level_min_cells, max_empty_m2, keep_out):
+    """Boxes [(centre, dims, yaw)] of one object's points (objects_to_boxes)."""
+    from scipy import ndimage
+    out = []
+    t = dominant_angle(Po[:, :2]) if len(Po) > 20 else 0.0
+    Pr = np.c_[_rot_xy(Po[:, :2], -t), Po[:, 2]]
+    lo = Pr[:, :2].min(0) - v / 2
+    ij = np.floor((Pr[:, :2] - lo) / v).astype(int)
+    seen = np.zeros(ij.max(0)[::-1] + 1, bool); seen[ij[:, 1], ij[:, 0]] = True
+    foot = ndimage.binary_fill_holes(_close(seen, 1))                          # points only lie on surfaces
+    top = np.full(seen.shape, -np.inf); np.maximum.at(top, (ij[:, 1], ij[:, 0]), Pr[:, 2])
+    near = ndimage.distance_transform_edt(~seen, return_distances=False, return_indices=True)
+    top = top[near[0], near[1]]                                                 # filled-in cells: nearest seen cell
+    levels = height_levels(top, foot, level_gap, level_min_cells)
+    ko = None
+    if keep_out is not None and len(keep_out[0]):                             # the target's footprint, this object's grid
+        kij = np.floor((_rot_xy(keep_out[0], -t) - lo) / v).astype(int)
+        ok = (kij[:, 0] >= 0) & (kij[:, 0] < foot.shape[1]) & (kij[:, 1] >= 0) & (kij[:, 1] < foot.shape[0])
+        if ok.any():
+            ko = np.zeros(foot.shape, bool); ko[kij[ok, 1], kij[ok, 0]] = True; ko = _dilate(ko, 1)
+    z_floor = None
+    for k, (h_lo, h_hi, surf) in enumerate(levels):
+        mask = foot & (top >= h_lo - 1e-9)
+        if ko is not None and surf > keep_out[1]:                               # a layer reaching above the target's
+            mask &= ~ko                                                         # bottom never fills the target's place
+        for a, b in decompose(mask, fill=fill, max_empty=max_empty_m2 / v ** 2):
+            x0, y0 = lo + a[::-1] * v; x1, y1 = lo + (b[::-1] + 1) * v
+            m = (Pr[:, 0] >= x0) & (Pr[:, 0] <= x1) & (Pr[:, 1] >= y0) & (Pr[:, 1] <= y1) & (Pr[:, 2] <= h_hi + 1e-9)
+            if k > 0:
+                m &= Pr[:, 2] > z_floor                                         # only this level's points set its extent
+            if not m.any():
+                continue
+            lo_q, hi_q = np.percentile(Pr[m], [0.5, 99.5], axis=0)              # robust to single noisy points
+            x0, y0 = max(x0, lo_q[0] - xy_margin), max(y0, lo_q[1] - xy_margin)
+            x1, y1 = min(x1, hi_q[0] + xy_margin), min(y1, hi_q[1] + xy_margin)
+            z0 = lo_q[2] - z_margin if k == 0 else z_floor                       # stacked on the level below
+            z1 = (hi_q[2] if len(levels) == 1 else surf) + z_margin               # one level: as tight as its points
+            if z1 <= z0:
+                continue
+            cxy = _rot_xy(np.array([[(x0 + x1) / 2, (y0 + y1) / 2]]), t)[0]
+            out.append(([float(cxy[0]), float(cxy[1]), float((z0 + z1) / 2)], [float(x1 - x0), float(y1 - y0), float(z1 - z0)], float(t)))
+        z_floor = surf + z_margin if len(levels) > 1 else None                  # only a next level stacks on it
     return out
 
 
@@ -419,7 +450,8 @@ def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, t
     boxes = objects_to_boxes(P[obst], sem[obst], v, M["min_voxels"], M["box_xy_margin_m"], M["box_z_margin_m"],
                              fill=M.get("box_fill", 0.7), max_empty_m2=M.get("box_max_empty_m2", 0.04), level_gap=M.get("level_gap_m", 0.06),
                              level_min_cells=M.get("level_min_cells", 8),
-                             keep_out=(P[is_tgt, :2], float(np.percentile(P[is_tgt, 2], 2))) if is_tgt.any() else None)
+                             keep_out=(P[is_tgt, :2], float(np.percentile(P[is_tgt, 2], 2))) if is_tgt.any() else None,
+                             workers=M.get("box_workers", 0))
     boxes.append({"name": "floor", "center": [org[0] + W * v / 2, org[1] + H * v / 2, -0.025], "dims": [W * v + 2, H * v + 2, 0.05], "yaw": 0.0})
 
     gb = map_to_base_xy(g[None, :2], base_pose_in_map)[0]
