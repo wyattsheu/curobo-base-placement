@@ -84,8 +84,9 @@ def robustness_multi(pl, stations, P, Qt, warm=False):
         A = stations[:, 3:9][:, [ARM_JOINTS.index(j) for j in jn]]
         A = np.repeat(A, K, 0); A = np.vstack([A, np.repeat(A[-1:], pad, 0)])
         seed = torch.tensor(A, device="cuda", dtype=torch.float32)
-    ok = pl.solve_envs(goal_multi(pl, envf, Pe, Qe), warm=seed)[:len(fr)]
-    cone = np.array([in_safety_cone(pl.cfg, f[None], p[:2])[0] for f, p in zip(fr, Pe[:len(fr)])])
+    cone = np.array([in_safety_cone(pl.cfg, f[None], p[:2])[0] for f, p in zip(envf, Pe)])
+    ok = pl.solve_envs(goal_multi(pl, envf, Pe, Qe), warm=seed, care=cone)[:len(fr)]
+    cone = cone[:len(fr)]
     return (ok & cone).reshape(n, K).mean(axis=1)
 
 

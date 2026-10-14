@@ -90,7 +90,7 @@ class BasePlacementPlanner:
         self.cub = self._cuboids(self.ik_rob)
         # 4. arm-only motion planner
         self.planner = MotionPlanner(MotionPlannerCfg.create(robot=rc_arm, scene_model=empty,
-                     collision_cache=near_cache, use_cuda_graph=False,
+                     collision_cache=near_cache, use_cuda_graph=True,
                      num_ik_seeds=P["planner_ik_seeds"], num_trajopt_seeds=P["planner_trajopt_seeds"]))
         self.planner.warmup(enable_graph=True, num_warmup_iterations=1)
         self.base_sph = np.array([[*k['center'], k['radius']] for k in kachaka_spheres(cfg)])   # 2. parking check: the base only
@@ -293,17 +293,19 @@ class BasePlacementPlanner:
         fr = (bases[:, None, :] + self.OFFS[None]).reshape(-1, 3)
         envf = np.vstack([fr, np.repeat(fr[-1:], self.E - len(fr), 0)]) if len(fr) < self.E else fr
         self.load_envs(envf)
-        ok = self.solve_envs(self.goal_from(envf))[:len(fr)]
-        return (ok & in_safety_cone(self.cfg, fr, self.gpos[:2])).reshape(n, len(self.OFFS)).mean(axis=1)
+        cone = in_safety_cone(self.cfg, envf, self.gpos[:2])               # outside it a perturbation fails anyway
+        ok = self.solve_envs(self.goal_from(envf), care=cone)[:len(fr)]
+        return (ok & cone[:len(fr)]).reshape(n, len(self.OFFS)).mean(axis=1)
 
-    def solve_envs(self, goal, warm=None):
+    def solve_envs(self, goal, warm=None, care=None):
         """Can the arm reach `goal` in each robustness environment? (bool per env)
         cuRobo's IK first runs Levenberg-Marquardt on random starts (pose only), then MPPI + L-BFGS with collisions from
         those seeds. Measured on real maps, that second stage turns many LM seeds that were ALREADY valid (collision-free,
         within limits, on the pose) into failures — more so with more seeds and later in the batch — while it rescues
         others. Both are checked by the same metrics, so an env counts as reachable if either the LM seeds or the
         optimised seeds contain a valid solution; the optimiser only runs when some env is still unsolved.
-        warm (E, dof): a known arm solution per env, put in place of the first seed."""
+        warm (E, dof): a known arm solution per env, put in place of the first seed.
+        care (E,) bool: envs whose answer matters (e.g. inside the safety cone); the others never trigger the optimiser."""
         ik, ns = self.ik_rob, self.cfg["profile"]["scorer_seeds"]
         g = goal.reorder_links(ik.kinematics.tool_frames)
         seeds = ik.seed_ik_solver.solve_batch(goal_tool_poses=g, return_seeds=ns).js_solution.position.view(self.E, ns, -1).clone()
@@ -312,7 +314,8 @@ class BasePlacementPlanner:
         lm = ik.config.use_lm_seed; ik.config.use_lm_seed = False            # seeds given: do not redo LM
         try:
             ok = ik.solve_pose(goal, seed_config=seeds, return_seeds=ns, run_optimizer=False).success.reshape(self.E, -1).any(dim=1)
-            if not bool(ok.all()):
+            need = ~ok if care is None else ~ok & torch.as_tensor(care, device=ok.device)
+            if bool(need.any()):
                 ok |= ik.solve_pose(goal, seed_config=seeds, return_seeds=ns).success.reshape(self.E, -1).any(dim=1)
         finally:
             ik.config.use_lm_seed = lm
