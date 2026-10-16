@@ -70,12 +70,15 @@ def load_lab_map(export_dir, voxel=0.02):
     m = inst >= 0; sem[m] = np.vectorize(cls_of.get)(inst[m])
     names = {i: n for i, n in enumerate(table["labels"])}
     xy, h = map3d_to_map(pts, A)
-    z = h - floor_height(h, sem, [i for i, n in names.items() if n == "floor"])
-    P = np.c_[xy, z]
+    floor = floor_height(h, sem, [i for i, n in names.items() if n == "floor"])
+    P = np.c_[xy, h - floor]
     if voxel:                                                                           # thin to one point per voxel
         _, keep = np.unique(np.floor(P / voxel).astype(np.int64), axis=0, return_index=True)
         keep = np.sort(keep); P, sem, inst = P[keep], sem[keep], inst[keep]
-    return {"means3D": P.astype(np.float32), "semantic_ids": sem, "instance_ids": inst.astype(np.int32)}, names, table
+    # floor_height_m: the height subtracted above. Frames that keep the raw plane-normal height (Grasp Lab Global's
+    # "native metric map") are this frame shifted up by it.
+    return {"means3D": P.astype(np.float32), "semantic_ids": sem, "instance_ids": inst.astype(np.int32),
+            "floor_height_m": np.float32(floor)}, names, table
 
 
 def main(argv=None):
