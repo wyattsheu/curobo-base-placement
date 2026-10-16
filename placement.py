@@ -73,6 +73,11 @@ class BasePlacementPlanner:
             n_scene, n_near = P["max_scene_boxes"], P["max_near_boxes"]
             window = {"x": list(S["window_x"]), "y": list(S["window_y"])}
         cache, near_cache = {"cuboid": n_scene}, {"cuboid": n_near}  # whole-body IK (base moves anywhere) / one station
+        M = cfg["map"]
+        if M.get("esdf_half_m", 0.0) > 0:                       # the signed distance grid around the grasp (scene_io.esdf_grid)
+            h, hz = M["esdf_half_m"], M["esdf_half_z_m"]
+            cache["voxel"] = near_cache["voxel"] = {"layers": 1, "dims": [2 * h, 2 * h, 2 * hz], "voxel_size": M["esdf_voxel_m"]}
+        self._vox, self._vox_scene = {}, {}                     # solver cuboid data → its voxel data / scene its grid holds
         self.T["scene_cache"], self.T["near_cache"] = float(n_scene), float(n_near)
         # one warp kernel covers envs x seeds x particles x robot spheres x cuboids and must stay below 2^31 work items:
         # with many boxes (real maps) or many spheres, score fewer stations per call instead of failing
@@ -84,19 +89,19 @@ class BasePlacementPlanner:
         # 1. whole-body IK: one problem (the decided gripper pose)
         self.ik_wb = InverseKinematics(InverseKinematicsCfg.create(robot=rc_wb, scene_model=empty,
                      collision_cache=cache, num_seeds=P["wb_seeds"], self_collision_check=True))
-        self.cub_wb = self._cuboids(self.ik_wb)
+        self.cub_wb = self._cuboids(self.ik_wb); self._vox[id(self.cub_wb)] = self._voxels(self.ik_wb)
         # 3. robustness: one problem per (candidate, perturbation), each with its own copy of the scene
         self.E = self.group * len(self.OFFS)
         self.ik_rob = InverseKinematics(InverseKinematicsCfg.create(robot=rc_arm, scene_model=[empty] * self.E,
                      collision_cache=near_cache, num_seeds=P["scorer_seeds"], self_collision_check=True, max_batch_size=self.E, multi_env=True))
         self.ik_rob.config.exit_early = False                   # solve_envs checks the LM seeds itself (see there)
-        self.cub = self._cuboids(self.ik_rob)
+        self.cub = self._cuboids(self.ik_rob); self._vox[id(self.cub)] = self._voxels(self.ik_rob)
         # the optimiser's own, smaller batch: only the perturbations LM left unsolved go through it (lazy_optimiser)
         self.Eo = min(self.E, P.get("optimiser_batch", len(self.OFFS)))
         self.ik_opt = InverseKinematics(InverseKinematicsCfg.create(robot=rc_arm, scene_model=[empty] * self.Eo,
                      collision_cache=near_cache, num_seeds=P["scorer_seeds"], self_collision_check=True, max_batch_size=self.Eo, multi_env=True))
         self.ik_opt.config.exit_early = False; self.ik_opt.config.use_lm_seed = False
-        self.cub_opt = self._cuboids(self.ik_opt)
+        self.cub_opt = self._cuboids(self.ik_opt); self._vox[id(self.cub_opt)] = self._voxels(self.ik_opt)
         # arm motion planner: not part of plan(); built the first time plan_arm() is called
         self.planner, self._arm_cfg = None, (rc_arm, near_cache, empty)
         if P.get("build_arm_planner", False):
@@ -119,6 +124,38 @@ class BasePlacementPlanner:
     def _cuboids(solver):
         d_ = solver.scene_collision_checker.data
         return getattr(d_, "cuboid", None) or getattr(d_, "cuboids")
+
+    @staticmethod
+    def _voxels(solver):
+        return getattr(solver.scene_collision_checker.data, "voxels", None)
+
+    def write_grid(self, vd, envf):
+        """The scene's signed distance grid (scene.esdf) into every environment of a solver, as write_boxes does for the
+        boxes: the grid values are copied once per scene, the grid's pose in each environment's base frame every call."""
+        g = getattr(self.scene, "esdf", None) if self.scene is not None else None
+        if vd is None:
+            return
+        if g is None:
+            vd.enable[:] = 0; vd.count[:] = 0
+            return
+        dev = vd.features.device
+        if self._vox_scene.get(id(vd)) is not self.scene:
+            f = torch.from_numpy(np.ascontiguousarray(g["sdf"]).reshape(-1)).to(dev)
+            if f.numel() > vd.features.shape[2]:
+                raise RuntimeError(f"esdf grid of {f.numel()} voxels, the cache holds {vd.features.shape[2]}")
+            vd.features[:, 0, :f.numel(), 0] = f
+            n = np.array(g["sdf"].shape, np.float32)
+            vd.params[:, 0, :3] = torch.from_numpy(n).to(dev); vd.params[:, 0, 3] = g["voxel"]
+            vd.dims[:, 0, :3] = torch.tensor(g["dims"], dtype=vd.dims.dtype, device=dev)
+            self._vox_scene[id(vd)] = self.scene
+        envf = np.atleast_2d(envf); c, y = np.asarray(g["center"], float), g["yaw"]
+        cy, sy = math.cos(-y), math.sin(-y)
+        dx, dy = envf[:, 0] - c[0], envf[:, 1] - c[1]
+        inv = np.zeros((len(envf), 7), np.float32)                      # grid-from-base, same closed form as the boxes
+        inv[:, 0] = cy * dx - sy * dy; inv[:, 1] = sy * dx + cy * dy; inv[:, 2] = -c[2]
+        ang = envf[:, 2] - y; inv[:, 3] = np.cos(ang / 2); inv[:, 6] = np.sin(ang / 2)
+        vd.inv_pose[:len(envf), 0, :7] = torch.from_numpy(inv).to(dev)
+        vd.enable[:, 0] = 1; vd.count[:] = 1
 
     def _take_scene(self, scene):
         """Gripper pose, search window and obstacle arrays (base frame) of one request; no GPU work. Without a scene:
@@ -244,6 +281,7 @@ class BasePlacementPlanner:
         cub.dims[:, :K, :3] = torch.from_numpy(self.D[idx].astype(np.float32)).to(dev)
         cub.enable[:, :K] = torch.from_numpy((np.arange(K)[None] < n[:, None]).astype(np.uint8)).to(dev)
         cub.count[:] = torch.from_numpy(n.astype(np.int32)).to(dev)
+        self.write_grid(self._vox.get(id(cub)), envf)
 
     def goal_from(self, F):
         """The decided gripper pose, expressed in the frame of a base standing at each row of F = [(x, y, yaw)]."""
@@ -403,6 +441,7 @@ class BasePlacementPlanner:
         t = time.perf_counter()
         planner = self._arm_planner()
         planner.update_world(self.scene_at(base, near=True))
+        self.write_grid(self._voxels(planner), np.asarray([base], float))
         pr = planner.plan_pose(self.goal_from(np.asarray([base], float)), self.start, max_attempts=5)
         self.T["arm_plan_s"] = time.perf_counter() - t
         if pr is None or not bool(pr.success.any()):

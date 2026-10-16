@@ -86,6 +86,7 @@ class PlanningScene:
     grasp_quat_base: tuple              # decided gripper orientation (wxyz) in the base frame
     base_pose_in_map: tuple             # Kachaka localisation (x, y, yaw)
     known: KnownMask                    # known area
+    esdf: dict = None                   # near the grasp: signed distance grid instead of boxes (esdf_grid), or None
 
 
 def load_request(path, cfg=None):
@@ -341,6 +342,44 @@ def _object_boxes(Po, v, xy_margin, z_margin, fill, level_gap, level_min_cells, 
     return out
 
 
+def esdf_grid(P, center, half, half_z, voxel, gap, margin, keep_out=None):
+    """Obstacle points around the grasp → a signed distance grid (metres, negative inside), axis-aligned in the map frame,
+    centred on `center`, 2·half × 2·half × 2·half_z, in cuRobo's VoxelGrid layout (x, y, z; voxel centres at
+    (i + 0.5)·voxel − half). Every voxel column is filled from its lowest to its highest point, cut wherever two
+    consecutive points are more than `gap` apart: a surface seen from above becomes solid below it, but a carton's floor
+    stays low next to its wall and a stray point above a table does not fill the space between. Distances are reduced
+    by `margin` in every direction; occupying whole voxels already moves a surface out by half a voxel on average.
+    keep_out = (xy (M, 2), z_bottom, grow): as for the boxes, nothing is filled inside the target's footprint (grown by
+    `grow`) above its bottom — the SLAM blurs the support up into the object, right where the fingers close."""
+    from scipy.ndimage import distance_transform_edt
+    n = np.array([round(2 * half / voxel), round(2 * half / voxel), round(2 * half_z / voxel)])
+    lo = np.asarray(center, float) - n * voxel / 2
+    occ = np.zeros(n, bool)
+    if len(P):
+        ijk = np.clip(np.floor((P - lo) / voxel).astype(int), 0, n - 1)
+        o = np.lexsort((ijk[:, 2], ijk[:, 1], ijk[:, 0]))
+        ijk = ijk[o]
+        new = np.r_[True, (np.diff(ijk[:, 0]) != 0) | (np.diff(ijk[:, 1]) != 0) | (np.diff(ijk[:, 2]) * voxel > gap)]
+        start = np.flatnonzero(new); end = np.r_[start[1:], len(ijk)] - 1
+        for a, b in zip(start, end):
+            occ[ijk[a, 0], ijk[a, 1], ijk[a, 2]:ijk[b, 2] + 1] = True
+    if keep_out is not None and len(keep_out[0]):
+        from scipy.ndimage import binary_dilation
+        fij = np.floor((np.asarray(keep_out[0], float) - lo[:2]) / voxel).astype(int)
+        ok = np.all((fij >= 0) & (fij < n[:2]), axis=1)
+        foot = np.zeros(n[:2], bool); foot[fij[ok, 0], fij[ok, 1]] = True
+        r = int(np.ceil(keep_out[2] / voxel)); yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+        foot = binary_dilation(foot, structure=xx ** 2 + yy ** 2 <= r * r)
+        k0 = int(np.clip(np.floor((keep_out[1] - lo[2]) / voxel), 0, n[2]))
+        occ[foot, k0:] = False
+    if occ.any():
+        sdf = np.where(occ, -(distance_transform_edt(occ) - 0.5), distance_transform_edt(~occ) - 0.5) * voxel - margin
+    else:
+        sdf = np.full(n, 10.0)
+    return {"sdf": sdf.astype(np.float16), "center": [float(c) for c in center], "dims": (n * voxel).tolist(),
+            "voxel": float(voxel), "occupied": int(occ.sum())}
+
+
 def boxes_map_to_base(boxes, base_pose_in_map):
     out = []
     for b in boxes:
@@ -454,6 +493,15 @@ def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, t
     obst = ~low & ~is_tgt & ~np.isin(sem, ign) & (np.linalg.norm(P[:, :2] - g[:2], axis=1) <= M["roi_radius_m"])
     if M.get("crop_to_window", False):
         obst &= window_reach_mask(P[:, :2], base_pose_in_map, cfg)
+    # around the grasp a 1 cm signed distance grid instead of boxes (map.esdf_half_m > 0): the fingers go within
+    # 1-3 cm of the clutter there, closer than 4 cm-grid boxes can tell apart
+    grid = None
+    if M.get("esdf_half_m", 0.0) > 0:
+        h, hz = M["esdf_half_m"], M["esdf_half_z_m"]
+        ing = (np.abs(P[:, 0] - g[0]) < h) & (np.abs(P[:, 1] - g[1]) < h) & (np.abs(P[:, 2] - g[2]) < hz) & (P[:, 2] >= M["esdf_min_z_m"])
+        ko = (P[is_tgt, :2], float(np.percentile(P[is_tgt, 2], 2)), grow) if is_tgt.any() else None
+        grid = esdf_grid(P[obst & ing], g, h, hz, M["esdf_voxel_m"], M["esdf_gap_m"], M.get("esdf_margin_m", 0.005), ko)
+        obst &= ~ing
     boxes = objects_to_boxes(P[obst], sem[obst], v, M["min_voxels"], M["box_xy_margin_m"], M["box_z_margin_m"],
                              fill=M.get("box_fill", 0.7), max_empty_m2=M.get("box_max_empty_m2", 0.04), level_gap=M.get("level_gap_m", 0.06),
                              level_min_cells=M.get("level_min_cells", 8),
@@ -465,5 +513,9 @@ def scene_from_slam(npz, base_pose_in_map, grasp_pos_map, grasp_quat_map, cfg, t
     sc = PlanningScene(boxes_map_to_base(boxes, base_pose_in_map), (float(gb[0]), float(gb[1]), float(g[2])),
                        tuple(quat_map_to_base(grasp_quat_map, base_pose_in_map[2])), tuple(base_pose_in_map),
                        known_mask)
+    if grid is not None:                                                        # grid pose: map → base frame
+        cb = map_to_base_xy(np.asarray(grid["center"][:2])[None], base_pose_in_map)[0]
+        grid["center"] = [float(cb[0]), float(cb[1]), float(grid["center"][2])]; grid["yaw"] = -float(base_pose_in_map[2])
+        sc.esdf = grid
     sc.target_points = int(is_tgt.sum()); sc.target_source = how; sc.known_source = "occupancy" if occupancy is not None else "slam_points"
     return sc
