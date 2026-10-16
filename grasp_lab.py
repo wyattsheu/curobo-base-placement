@@ -135,12 +135,11 @@ def depth_cloud(cap):
         d_o, _ = cKDTree(cap["object_map"]).query(pm[tgt], distance_upper_bound=TARGET_NEAR_M)   # nor obstacle
         ok = ~tgt.copy(); ok[np.flatnonzero(tgt)[np.isfinite(d_o)]] = True
         pm, tgt = pm[ok], tgt[ok]
-    key = np.floor(pm / WRIST_VOXEL_M).astype(np.int64)
-    _, inv = np.unique(key, axis=0, return_inverse=True)
-    inv = inv.reshape(-1)
-    n = inv.max() + 1
-    is_t = np.zeros(n, bool); np.logical_or.at(is_t, inv, tgt)                  # a voxel with any target pixel is target
-    first = np.full(n, -1); first[inv[::-1]] = np.arange(len(inv))[::-1]
+    k = np.floor(pm / WRIST_VOXEL_M).astype(np.int64); k -= k.min(0)
+    span = k.max(0) + 1
+    key = (k[:, 0] * span[1] + k[:, 1]) * span[2] + k[:, 2]                   # one integer per voxel, (x, y, z) order
+    _, first, inv = np.unique(key, return_index=True, return_inverse=True)      # first pixel of every voxel
+    is_t = np.bincount(inv.reshape(-1), weights=tgt.astype(float), minlength=len(first)) > 0   # any target pixel in it
     return pm[first], is_t
 
 

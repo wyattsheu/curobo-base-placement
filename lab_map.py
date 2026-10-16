@@ -55,7 +55,40 @@ def floor_height(h, sem, floor_ids):
     return float((edges[k] + edges[k + 1]) / 2)
 
 
-def load_lab_map(export_dir, voxel=0.02):
+CACHE_VERSION = 1
+
+
+def _cache_file(export_dir, voxel):
+    """Where load_lab_map keeps its result for this export: keyed by the source files' names, sizes and times, so a
+    changed map is processed again. $CUROBO_MAP_CACHE, else .map_cache/ next to this file (map folders are often read-only)."""
+    import hashlib
+    srcs = [_one(export_dir, p) for p in ("*_sem_color_fine.npz", "*_instance_labels.npz",
+                                          "*_instance_semantic_table_fine.json", "alignment_*.yaml")]
+    sig = json.dumps([CACHE_VERSION, voxel] + [[os.path.abspath(f), os.path.getsize(f), int(os.path.getmtime(f))] for f in srcs])
+    d = Path(os.environ.get("CUROBO_MAP_CACHE", Path(__file__).resolve().parent / ".map_cache"))
+    return d / f"{Path(export_dir).resolve().name}_{hashlib.sha1(sig.encode()).hexdigest()[:12]}.npz"
+
+
+def load_lab_map(export_dir, voxel=0.02, cache=True):
+    """→ (data, class names, instance table). The first call per export processes the raw map (~3 s for map803: every
+    point's instance, the alignment, the floor height) and saves the result; later calls read it (~1 ms)."""
+    table = json.loads(Path(_one(export_dir, "*_instance_semantic_table_fine.json")).read_text(encoding="utf-8"))
+    names = {i: n for i, n in enumerate(table["labels"])}
+    f = _cache_file(export_dir, voxel) if cache else None
+    if f is not None and f.exists():
+        with np.load(f) as z:
+            return {k: z[k] for k in z.files}, names, table
+    data, names, table = _process(export_dir, voxel)
+    if f is not None:
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_suffix(".tmp.npz"); np.savez(tmp, **data); os.replace(tmp, f)
+        except OSError:
+            pass                                                                # cache is optional
+    return data, names, table
+
+
+def _process(export_dir, voxel):
     pts = np.load(_one(export_dir, "*_sem_color_fine.npz"))["points"].astype(float)
     lab = np.load(_one(export_dir, "*_instance_labels.npz"))
     table = json.loads(Path(_one(export_dir, "*_instance_semantic_table_fine.json")).read_text(encoding="utf-8"))

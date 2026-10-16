@@ -187,10 +187,47 @@ python -c "import curobo, torch; print(curobo.__version__, torch.__version__, to
 ```bash
 python run_demo.py                                                   # test_maps/slam.npz + test_maps/request.json
 python run_demo.py --npz /maps/xxx.npz --request request.json
-# 常駐：solver 只在啟動時建一次（Thor 約 12 s），之後每行一個請求（request.json 路徑，或請求本身的 JSON，
+# 常駐：solver 只在啟動時建一次（Thor 約 14 s），之後每行一個請求（request.json 路徑，或請求本身的 JSON，
 # 可帶 "lab_map" / "npz" / "occupancy" 換地圖，地圖只讀一次），每個請求印一行 @@JSON@@
 python run_demo.py --lab-map /maps/auto_20260826 --serve < requests.txt
 ```
+
+### 放到系統上：常駐一次，請求只付自己的時間
+
+建規劃器（cuRobo 的所有 solver、暖機）在 Thor 上要 **約 14 s**，整理一張 SLAM 地圖第一次要 **約 4 s**。這兩件事都只在系統啟動時做一次，
+**不要每個請求重建**；之後每個請求只把障礙物寫進已經建好的 solver。
+
+| 時機 | 做什麼 | Thor 實測 |
+|---|---|---|
+| 系統啟動（一次） | `planner = BasePlacementPlanner(cfg)` | ~14 s |
+| 系統啟動（每張地圖一次） | `slam, names, _ = load_lab_map(map_dir)`：第一次整理後存到 `.map_cache/`（`$CUROBO_MAP_CACHE` 可改位置），之後直接讀 | 第一次 ~3.8 s，之後 ~7 ms |
+| 每次手腕拍照 | `world = grasp_lab.fuse(cfg, slam, cap, names)`（學長的合併地圖到了之後改讀那份） | ~0.19 s |
+| 每個候選抓取 | `scene_from_slam(world, …)` → `planner.set_scene(scene)` → `planner.plan()` | 0.18 s ＋ 0.3–0.8 s（有 27/27 站位）；無解 ~1.5 s；退路 5–7 s |
+| 到位後（需要時） | 重新拍照 → `set_scene` → `planner.plan_arm()` | ~0.3 s |
+
+兩種接法：
+1. **Python 直接呼叫**（實驗室的程式和這裡同一個行程）：照 `demo_multi_grasp.py` 的 `start()` / `merge()` / `solve()` / `pick()`。
+2. **另一個常駐行程**：`python run_demo.py --serve`，stdin 每行一個請求（`request.json` 路徑或請求本身的 JSON，可帶 `"lab_map"` / `"npz"` /
+   `"occupancy"` 換地圖），stdout 每個請求一行 `@@JSON@@{…}`；啟動完成時 stderr 印 `ready (setup …s)`。之後要接 ROS 2 service，就是把這個迴圈換成 service callback。
+
+Thor 上的啟動指令（實驗室的 `mm-gpu:latest` 映像；warp kernel 的編譯快取要掛出來，否則每次啟動都重新編譯）：
+
+```bash
+cd ~/curobo-base-placement
+docker run -d --name base_placement --restart unless-stopped --runtime nvidia --gpus all \
+  -v $PWD:/work -w /work \
+  -v $PWD/.warp_cache:/root/.cache/warp \
+  -v /home/acm/robotic_agent/robotic_system/robot_ws/data/lab:/maps:ro \
+  -v /home/acm/mm_system_prod/main_ws/grasp_logs:/grasp_logs:ro \
+  --entrypoint bash mm-gpu:latest -c "python3 run_demo.py --lab-map /maps/map803_0930 --serve"
+```
+
+注意：
+- 呼叫這些函式的腳本要有 `if __name__ == "__main__":`：切方塊用多個 CPU 行程（`map.box_workers`），沒有的話會退回單核心（結果相同、較慢）。
+  每個行程的第一個請求建場景較慢（~0.6 s），因為要啟動這些行程。
+- GPU 記憶體：所有 solver 常駐約 0.5 GB。容量固定（`profile.max_scene_boxes`、`max_near_boxes`、ESDF 範圍），請求超過會報錯而不是偷偷丟障礙物。
+- 一次要試很多個抓取：照上游的信心分數依序試、第一個 27/27 就停（`demo_multi_grasp.py --first`）比全部試完再挑快很多：Thor 上 10 個全試 30 s，
+  大部分花在只有較弱站位的抓取上。
 
 ### 從沒有 GPU 的電腦丟到 server 跑（server 上不留任何檔案）
 

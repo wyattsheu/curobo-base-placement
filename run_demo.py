@@ -62,7 +62,9 @@ def load_map(args, cache):
             occ = sorted(Path(args.lab_map).glob("occupancy_*.yaml"))
             cache[key] = (data, names, str(occ[0]) if occ else None)
         else:
-            cache[key] = (args.npz, scene_io.load_class_names(Path(args.npz).with_suffix(".json")), None)
+            with np.load(args.npz) as z:                                        # read once, kept in memory
+                data = {k: z[k] for k in z.files}
+            cache[key] = (data, scene_io.load_class_names(Path(args.npz).with_suffix(".json")), None)
     return cache[key]
 
 
