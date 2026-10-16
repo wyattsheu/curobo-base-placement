@@ -16,13 +16,16 @@ It does not choose grasps, plan the navigation path, or build / align maps.
 The lab's map803 SLAM map with a real wrist capture (Grasp Lab Global). The board and the box are added obstacles.
 Grey = SLAM points, blue = wrist camera, red = the bottle, green rectangle = the base pose we output.
 
-| Bottle out of reach: drive to a good spot | Already beside it: a small correction |
+| Starting 1.5–1.9 m away: drive to the right spot | Starting 1.0–1.4 m away |
 |:---:|:---:|
-| <img src="docs/media/far.gif" width="430"> | <img src="docs/media/near.gif" width="430"> |
-| starts 1.0–1.4 m away, drives 0.34 m · [mp4](docs/media/far.mp4) | 21/27 where it stands, moves 0.10 m to 27/27 · [mp4](docs/media/near.mp4) |
-| **Board in front: reject the front grasp, use a side grasp** | **Box in front: move, then reach over it** |
-| <img src="docs/media/board.gif" width="430"> | <img src="docs/media/box.gif" width="430"> |
-| front grasp rejected (no IK solution); side grasp after driving 0.51 m · [mp4](docs/media/board.mp4) | 9/27 where it stands, moves 0.17 m to 27/27 · [mp4](docs/media/box.mp4) |
+| <img src="docs/media/far2.gif" width="430"> | <img src="docs/media/far.gif" width="430"> |
+| a side grasp; drives 1.45 m to a 27/27 spot · [mp4](docs/media/far2.mp4) | the executed grasp; drives 0.34 m · [mp4](docs/media/far.mp4) |
+| **Already beside it: a small correction** | **Board in front: reject the front grasp, use a side grasp** |
+| <img src="docs/media/near.gif" width="430"> | <img src="docs/media/board.gif" width="430"> |
+| 21/27 where it stands, moves 0.10 m to 27/27 · [mp4](docs/media/near.mp4) | front grasp rejected (no IK solution); side grasp after driving 0.51 m · [mp4](docs/media/board.mp4) |
+| **Box in front: move, then reach over it** | |
+| <img src="docs/media/box.gif" width="430"> | |
+| 9/27 where it stands, moves 0.17 m to 27/27 · [mp4](docs/media/box.mp4) | |
 
 ## Installation
 
