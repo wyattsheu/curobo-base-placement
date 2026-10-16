@@ -17,12 +17,15 @@ Merging (no registration here; the alignment is used as saved): what the wrist c
     inside its view. A SLAM point is dropped when it projects onto a valid depth pixel and lies more than CARVE_TOL_M in
     front of the measured surface: the camera saw through it, so it is no longer there (scenes change after mapping —
     a moved carton stays in the SLAM map). Points behind the surface, outside the image or on missing depth stay.
-    The depth image (up to MAX_DEPTH_M, thinned to WRIST_VOXEL_M) is then added. target_mask = the segmented pixels,
-    SLAM points within map.target_grow_m of them, and every SLAM instance of the capture's class (summary.json label)
-    with at least SAME_OBJECT_FRAC of its points within SAME_OBJECT_M of them: the SLAM's own, blurrier copy of the
-    object, which hides behind it where the camera cannot clear it.
+    SLAM objects of the capture's class (summary.json label, e.g. bottle) with at least STALE_VIEW_FRAC of their points
+    inside the camera image are dropped whole, hidden parts included — only with --drop-stale, a one-off for this test
+    data (map803 scanned 9/30 with several bottles on the table, captures from 10/08 with one); a map scanned together
+    with the capture does not need it.
+    The depth image (up to MAX_DEPTH_M, thinned to WRIST_VOXEL_M) is then added. target_mask = segmented pixels within
+    TARGET_NEAR_M of Grasp Lab's own cleaned object cloud (clouds.npz object_pts) and SLAM points within
+    map.target_grow_m of it. Segmented pixels farther from it are depth-edge mixed pixels and are left out entirely.
 
-    python grasp_lab.py --lab-map <map dir> --run <run dir> [--run ...] --out <dir> [--top 6]
+    python grasp_lab.py --lab-map <map dir> --run <run dir> [--run ...] --out <dir> [--top 6] [--drop-stale]
 writes <dir>/<run>.npz (+ .json class names) and <dir>/<run>_requests.jsonl: one request per line for
 `run_demo.py --serve`, Kachaka starting where it stood for the capture, the executed grasp first, then GraspGen's best.
 """
@@ -40,7 +43,8 @@ HERE = Path(__file__).parent
 CARVE_TOL_M = 0.05          # a SLAM point must be this far in front of the measured depth to be dropped (alignment + depth noise)
 MAX_DEPTH_M = 1.5           # depth farther than this is neither added nor used to drop SLAM points
 WRIST_VOXEL_M = 0.01
-SAME_OBJECT_M, SAME_OBJECT_FRAC = 0.05, 0.3
+STALE_VIEW_FRAC = 0.3       # SLAM object of the target's class this much inside the camera image → stale, dropped whole
+TARGET_NEAR_M = 0.015       # a segmented depth pixel counts as the target only this close to the cleaned object cloud
 RZ90 = np.array([[0.0, -1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
 
 
@@ -126,6 +130,11 @@ def depth_cloud(cap):
     pc = np.c_[(u - cx) * z / fx, (v - cy) * z / fy, z]
     T = cap["map_from_cam"]; pm = pc @ T[:3, :3].T + T[:3, 3]
     tgt = cap["seg"][v, u] if cap.get("seg") is not None else np.zeros(len(pm), bool)
+    if tgt.any() and len(cap["object_map"]):                                   # mask pixels off the object's surface are
+        from scipy.spatial import cKDTree                                       # depth-edge mixed pixels: neither target
+        d_o, _ = cKDTree(cap["object_map"]).query(pm[tgt], distance_upper_bound=TARGET_NEAR_M)   # nor obstacle
+        ok = ~tgt.copy(); ok[np.flatnonzero(tgt)[np.isfinite(d_o)]] = True
+        pm, tgt = pm[ok], tgt[ok]
     key = np.floor(pm / WRIST_VOXEL_M).astype(np.int64)
     _, inv = np.unique(key, axis=0, return_inverse=True)
     inv = inv.reshape(-1)
@@ -133,6 +142,24 @@ def depth_cloud(cap):
     is_t = np.zeros(n, bool); np.logical_or.at(is_t, inv, tgt)                  # a voxel with any target pixel is target
     first = np.full(n, -1); first[inv[::-1]] = np.arange(len(inv))[::-1]
     return pm[first], is_t
+
+
+def in_image(cap, P):
+    """Map points that project inside the wrist image (in front of the camera)."""
+    T = np.linalg.inv(cap["map_from_cam"]); pc = P @ T[:3, :3].T + T[:3, 3]
+    fx, fy, cx, cy = cap["K"]; H, W = cap["depth_m"].shape
+    z = np.maximum(pc[:, 2], 1e-9); u = pc[:, 0] / z * fx + cx; v = pc[:, 1] / z * fy + cy
+    return (pc[:, 2] > 0.05) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+
+def stale_instances(cap, data, names):
+    """SLAM instances of the capture's class mostly inside the camera image: the camera shows what is there now."""
+    cls = {v: int(k) for k, v in (names or {}).items()}.get(cap.get("label"))
+    if cls is None or "depth_m" not in cap:
+        return []
+    P = np.asarray(data["means3D"], float); inst = np.asarray(data["instance_ids"]); sem = np.asarray(data["semantic_ids"])
+    cand = np.unique(inst[(sem == cls) & (inst >= 0)])
+    return [int(i) for i in cand if in_image(cap, P[inst == i]).mean() >= STALE_VIEW_FRAC]
 
 
 def seen_through(cap, P):
@@ -148,13 +175,14 @@ def seen_through(cap, P):
     return out
 
 
-def fuse(cfg, data, cap, names=None):
+def fuse(cfg, data, cap, names=None, drop_stale=False):
     """SLAM map with the wrist camera's view replacing it → the npz fields scene_io reads (target_mask marks the object).
     Without a depth image, falls back to SLAM ∪ the recorded clouds."""
     from scipy.spatial import cKDTree
     P = np.asarray(data["means3D"], float)
+    stale = stale_instances(cap, data, names) if drop_stale else []
     if "depth_m" in cap:
-        drop = seen_through(cap, P)
+        drop = seen_through(cap, P) | np.isin(np.asarray(data["instance_ids"]), stale)
         W, obj = depth_cloud(cap)
     else:
         drop = np.zeros(len(P), bool)
@@ -163,20 +191,14 @@ def fuse(cfg, data, cap, names=None):
     keep = ~drop
     near_obj = np.zeros(len(P), bool)
     if obj.any():
-        dist, _ = cKDTree(W[obj]).query(P, distance_upper_bound=SAME_OBJECT_M)
-        near_obj = dist <= cfg["map"]["target_grow_m"]
-        cls = {v: int(k) for k, v in (names or {}).items()}.get(cap.get("label"))
-        inst = np.asarray(data["instance_ids"]); sem = np.asarray(data["semantic_ids"])
-        for i in np.unique(inst[np.isfinite(dist) & (inst >= 0)]) if cls is not None else []:
-            m = inst == i
-            if sem[m][0] == cls and np.isfinite(dist[m]).mean() >= SAME_OBJECT_FRAC:
-                near_obj |= m
+        dist, _ = cKDTree(W[obj]).query(P, distance_upper_bound=cfg["map"]["target_grow_m"])
+        near_obj = np.isfinite(dist)
     return {"means3D": np.vstack([P[keep], W]).astype(np.float32),
             "semantic_ids": np.r_[np.asarray(data["semantic_ids"])[keep], np.full(len(W), 255)].astype(np.uint8),
             "instance_ids": np.r_[np.asarray(data["instance_ids"])[keep], np.full(len(W), -1)].astype(np.int32),
             "target_mask": np.r_[near_obj[keep], obj],
             "from_wrist": np.r_[np.zeros(int(keep.sum()), bool), np.ones(len(W), bool)],
-            "n_slam_dropped": np.int64(drop.sum())}
+            "n_slam_dropped": np.int64(drop.sum()), "stale_instances": np.asarray(stale, np.int64)}
 
 
 def requests(cfg, cap, top=6, min_sep_m=0.01, min_sep_deg=10.0):
@@ -208,6 +230,8 @@ def main(argv=None):
     ap.add_argument("--run", action="append", required=True, help="Grasp Lab run folder (repeatable)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--top", type=int, default=6, help="GraspGen grasps per run besides the executed one")
+    ap.add_argument("--drop-stale", action="store_true", help="test data only: drop SLAM objects of the target's class "
+                    "that the camera should see (map and capture from different days)")
     a = ap.parse_args(argv)
     cfg = load_config(a.config)
     from lab_map import load_lab_map
@@ -217,7 +241,7 @@ def main(argv=None):
     for run in a.run:
         cap = load_capture(run, float(data["floor_height_m"]), a.lab_map)
         f = out / f"{cap['run']}.npz"
-        F = fuse(cfg, data, cap, names)
+        F = fuse(cfg, data, cap, names, a.drop_stale)
         np.savez_compressed(f, **F)
         f.with_suffix(".json").write_text(json.dumps({str(k): v for k, v in names.items()}, ensure_ascii=False), encoding="utf-8")
         R = requests(cfg, cap, a.top)
@@ -226,6 +250,7 @@ def main(argv=None):
                 fh.write(json.dumps({**r, "npz": str(f), "occupancy": str(occ[0]) if occ else None}) + "\n")
         print(json.dumps({"run": cap["run"], "alignment_mode": cap["alignment_mode"], "start": R[0]["base_pose_in_map"] if R else None,
                           "requests": len(R), "slam_points_dropped": int(F["n_slam_dropped"]),
+                          "stale_instances_dropped": F["stale_instances"].tolist(), "target_points": int(F["target_mask"].sum()),
                           "wrist_points": int(F["from_wrist"].sum()), **checks(cfg, data, cap)}))
 
 
