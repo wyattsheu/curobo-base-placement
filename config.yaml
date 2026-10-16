@@ -57,6 +57,7 @@ robustness:
   # 導航到位誤差：±xy、±yaw 各取三點（-, 0, +）共 27 種。← 用 Kachaka 實測誤差取代
   perturb_xy_m: 0.05
   perturb_yaw_deg: 5.0
+  perturb_points: 27                    # 27 = 每個軸 (-, 0, +) 全部組合；9 = 中心 + 8 個角落（±xy、±yaw 同時取極端）
   threshold: 1.0                        # 27 種都要抓得到才算通過
   min_accept: 0.5                       # 沒有站位達到 threshold 時，退路只接受穩健度 ≥ 這個值的站位；都不到就回報無解（reason = not_robust）
 
@@ -79,6 +80,9 @@ profile:
   # 擾動（和後面站位的）裝滿一次呼叫去最佳化。選站規則不變；false = 舊做法（只用來比對）
   lazy_optimiser: true
   optimiser_batch: 27                    # 第二段最佳化自己的批次大小（只裝 LM 沒解出來的擾動）
+  # 評分時用每個站位分數的上下界跳過不可能改變答案的計算（選出的站位不變）：上界到不了門檻的站位不跑第二段最佳化；
+  # 沒有站位通過時，依上界由高到低評，上界贏不過目前最好的分數就停止。false = 全部評完（只用來比對）
+  bound_scoring: false
   # 常駐模式（run_demo.py --serve）：solver 只在啟動時建一次，容量固定；請求超過就報錯，改大這兩個值
   max_scene_boxes: 1024                 # 整體 IK：搜尋視窗內的方塊上限（真實地圖約 350–950）
   max_near_boxes: 320                   # 評分／手臂規劃：一個站位手臂碰得到的方塊上限（實測最多約 190）

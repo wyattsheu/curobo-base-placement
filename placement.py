@@ -59,7 +59,10 @@ class BasePlacementPlanner:
         t0 = time.perf_counter()
         d, a = Rb["perturb_xy_m"], math.radians(Rb["perturb_yaw_deg"])
         self.d = d
-        self.OFFS = np.array([(dx, dy, dp) for dx in (-d, 0, d) for dy in (-d, 0, d) for dp in (-a, 0, a)])
+        if Rb.get("perturb_points", 27) == 9:                    # the centre and the 8 corners of the ±xy/±yaw box
+            self.OFFS = np.array([(0.0, 0.0, 0.0)] + [(dx, dy, dp) for dx in (-d, d) for dy in (-d, d) for dp in (-a, a)])
+        else:                                                   # every combination of (-, 0, +) per axis
+            self.OFFS = np.array([(dx, dy, dp) for dx in (-d, 0, d) for dy in (-d, 0, d) for dp in (-a, 0, a)])
         # every robot sphere, in any arm pose, stays within `reach` of the shoulder (`pivot`): a box farther away never comes
         # within the activation distance of any sphere, so it adds exactly nothing to any cost or collision check
         self.pivot, reach, self.tool_reach = arm_reach(cfg)
@@ -399,7 +402,7 @@ class BasePlacementPlanner:
 
     def _finish(self, S, order, j):
         """Station j's final score needs the optimiser for the perturbations LM left unsolved (outside the safety cone
-        they fail anyway). Only those go in, packed with the next unfinished stations' until one call is full."""
+        they fail anyway). Only those go in, packed with the next unfinished stations' (in `order`) until one call is full."""
         if not S[j]["todo"].any():
             return
         slots, B = [], self.Eo
@@ -487,11 +490,30 @@ class BasePlacementPlanner:
             # the optimiser only runs where it can change the answer: LM scores every candidate first; a station's
             # unsolved perturbations are optimised when its final score is needed
             S = self._timed("scoring_s", self._lm_pass, U, order)
-            for j in order:
-                self._timed("scoring_s", self._finish, S, order, j)
-                checked[j] = float(S[j]["ok"].mean())
+            K = len(self.OFFS)
+            lo = lambda j: int(S[j]["ok"].sum())                     # solved so far: the score is at least this
+            hi = lambda j: lo(j) + int(S[j]["todo"].sum())           # if the optimiser rescued every unsolved one
+            bound = P.get("bound_scoring", False)
+            seq = [j for j in order if hi(j) >= th * K - 1e-9] if bound else order   # the rest cannot reach the threshold
+            for j in seq:
+                self._timed("scoring_s", self._finish, S, seq, j)
+                checked[j] = lo(j) / K
                 if checked[j] >= th - 1e-9:
                     best = j; break
+            if best is None and bound:
+                # nobody passes: the fallback is the highest score (nearest on ties). Highest upper bound first; once
+                # a station's upper bound cannot beat the best final score so far, neither can anyone after it
+                rest = sorted((j for j in order if j not in checked), key=lambda j: (-hi(j), dist[j]))
+                top = max(checked, key=lambda j: (checked[j], -dist[j])) if checked else None
+                for n_, j in enumerate(rest):
+                    if top is not None and (hi(j) < checked[top] * K - 1e-9 or
+                                            (hi(j) <= checked[top] * K + 1e-9 and dist[j] >= dist[top])):
+                        break
+                    if hi(j) > lo(j):
+                        self._timed("scoring_s", self._finish, S, rest[n_:], j)
+                    checked[j] = lo(j) / K
+                    if top is None or (checked[j], -dist[j]) > (checked[top], -dist[top]):
+                        top = j
         else:                                                        # previous way: whole groups through the optimiser
             for g0 in range(0, len(order), self.group):
                 idx = np.array(order[g0:g0 + self.group])
