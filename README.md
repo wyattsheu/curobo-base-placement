@@ -1,216 +1,154 @@
-# curobo-base-placement：用 cuRobo 最佳化找出 Kachaka 該停在哪裡才抓得到
+# curobo-base-placement: where should Kachaka stand to grasp?
 
-上游已經決定好**抓什麼**和**夾爪最終位姿**（位置＋朝向），但原地被障礙物擋住抓不到。這個專案只做一件事：
+Upstream has already decided **what to grasp** and **the gripper's final pose** (position + orientation). This project
+answers one question:
 
-> 根據 **3D SLAM 點雲**和**上游請求**，決定 **Kachaka 要停到哪裡**（給 `Navigate_to_pose` 的目標），並確認停過去之後，
-> 用**同一個夾爪位姿**手臂抓得到、而且整段動作不會撞到東西。
+> Given the **3D SLAM point cloud** and that **gripper pose**, where should the Kachaka base drive to (the goal for
+> `Navigate_to_pose`), so that from there the arm can still reach **the same gripper pose** without hitting anything —
+> even if Kachaka stops a few centimetres or degrees off?
 
-不做：選抓取方向、改夾爪姿勢、2D 地圖、導航路徑本身（交給 Kachaka 的 `Navigate_to_pose`）。
+It does **not** choose grasps, change the gripper pose, plan the navigation path, or build/align maps.
 
-機器人：Kachaka（移動底盤）＋ AgileX Piper 6 軸手臂（Robot129）。規劃：cuRobo v2 的 9 軸 whole-body IK（底盤 x, y, ψ ＋手臂 6 軸）。
+Robot: Kachaka mobile base + AgileX Piper 6-DoF arm (Robot129). Planner: cuRobo v2, 9-DoF whole-body IK
+(base x, y, yaw + 6 arm joints), on an NVIDIA Jetson Thor or any CUDA GPU.
+
+| Bottle out of reach: drive there | Already beside it: small correction |
+|---|---|
+| ![far](docs/media/far.gif) | ![near](docs/media/near.gif) |
+| [far.mp4](docs/media/far.mp4) — starts 1.0–1.4 m away, drives 0.34 m | [near.mp4](docs/media/near.mp4) — 21/27 where it stands, moves 0.10 m to 27/27 |
+| **A board in front of the bottle** | **A box on the floor in front of Kachaka** |
+| ![board](docs/media/board.gif) | ![box](docs/media/box.gif) |
+| [board.mp4](docs/media/board.mp4) — the frontal grasp is rejected; a side grasp works after driving 0.51 m | [box.mp4](docs/media/box.mp4) — 9/27 where it stands, moves 0.17 m, the arm reaches over the box |
+
+All four use the lab's map803_0930 SLAM map with a real wrist capture (Grasp Lab Global, see [§8](#8-the-teammates-aligned-wrist-scene-grasp-lab-global));
+the board and the box are added as point clouds. Stations come from `plan()`, the arm motion from `plan_arm()`.
 
 ---
 
-## 1. 輸入
+## Contents
 
-### 1.1 3D SLAM 點雲：`.npz`
+1. [How to call it](#1-how-to-call-it)
+2. [Deploying on the robot](#2-deploying-on-the-robot)
+3. [Inputs](#3-inputs)
+4. [Outputs](#4-outputs)
+5. [How it works](#5-how-it-works)
+6. [Installation](#6-installation)
+7. [Configuration](#7-configuration-configyaml)
+8. [The teammate's aligned wrist scene (Grasp Lab Global)](#8-the-teammates-aligned-wrist-scene-grasp-lab-global)
+9. [Validation and measurements](#9-validation-and-measurements)
+10. [Files](#10-files)
+11. [Known limitations and open items](#11-known-limitations-and-open-items)
 
-| 欄位 | 形狀 / 型別 | 必填 | 用途 |
-|---|---|---|---|
-| `means3D` | (N, 3) float32，公尺 | **必填** | 點的位置，**SLAM 地圖座標**（和 Kachaka 定位用的是同一張地圖）。z 朝上、地板在 z ≈ 0 |
-| `semantic_ids` | (N,) uint8 | 選填 | 每個點的類別 id。有的話先依類別分物體；沒有也能用（見 1.4） |
-| 目標物遮罩（名稱自訂，例 `target_mask`）| (N,) bool | 建議 | SLAM 標出的**目標物的點**；這些點是要抓的東西，不當障礙物 |
-| `logit_opacities` | (N, 1) | 選填 | 3D Gaussian 的不透明度；> 0 的點才採用 |
-| 同名 `.json`（例 `slam.json`）| `{"0": "floor", "1": "table", …}` | 選填 | 類別 id → 名稱；讓 request 能用名稱指定類別 |
+---
 
-**不需要**：障礙物方塊、障礙物清單、網格地圖。障礙物由程式從點雲自己算（`scene_io.py:190 objects_to_boxes`）：
-地板以上、夾爪位置 1.8 m 內、不是目標物的點，全部都算障礙物。
+## 1. How to call it
 
-其他格式（PLY、PCD、ROS PointCloud2）只要轉成 `means3D` 存成 npz 即可，例如：
+Three things cost time once; everything per request is small. **Build the planner and load the map at startup, never
+per request.** Times are medians measured on the Jetson Thor (120 W mode, GPU shared with the lab's Qwen / Molmo
+containers).
 
 ```python
-np.savez("map.npz", means3D=xyz.astype(np.float32))                                   # 最少
-np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)            # 建議
+from robot_model import load_config
+from placement import BasePlacementPlanner
+from lab_map import load_lab_map
+import scene_io, grasp_lab
+
+cfg = load_config("config.yaml")
+
+# ---- 1. at startup, once -----------------------------------------------------------------------------------------
+planner = BasePlacementPlanner(cfg)                    # ~14 s: every cuRobo solver built and warmed up
+slam, names, _ = load_lab_map("/maps/map803_0930")     # ~3.8 s the first time a map is ever seen, then ~7 ms (.map_cache/)
+occupancy = "/maps/map803_0930/occupancy_map803_0930.yaml"   # Kachaka's 2D map: where the base may park
+
+# ---- 2. once per wrist capture ----------------------------------------------------------------------------------
+cap = grasp_lab.load_capture("/grasp_logs/20261008_045944_bottle", float(slam["floor_height_m"]), "/maps/map803_0930")
+world = grasp_lab.fuse(cfg, slam, cap, names)          # ~0.19 s: SLAM map + what the wrist camera saw
+base_pose = grasp_lab.kachaka_pose(cfg, cap["map_from_arm"])   # where Kachaka stands now (x, y, yaw), map frame
+
+# ---- 3. once per candidate grasp ----------------------------------------------------------------------------------
+for grasp in grasps:                                   # each {"position": [x, y, z], "quaternion_wxyz": [...]}, map frame
+    scene = scene_io.scene_from_slam(world, base_pose, grasp["position"], grasp["quaternion_wxyz"], cfg,
+                                     target={"mask_key": "target_mask"}, occupancy=occupancy)    # ~0.18 s
+    planner.set_scene(scene)
+    result = planner.plan()                            # 0.3–0.8 s with a 27/27 station; ~1.5 s if impossible
+    if result["ok"]:
+        x, y, yaw = result["chosen_map"]               # → Navigate_to_pose
+    else:
+        print("rejected:", result["reason"])           # no_ik_solution / outside_cone / cannot_park / not_robust
+
+# ---- 4. after Kachaka has arrived and upstream has looked at the target again (separate step) --------------------
+planner.set_scene(scene_io.scene_from_slam(world, arrived_pose, new_grasp_pos, new_grasp_quat, cfg, ...))
+arm = planner.plan_arm()                               # ~0.3 s: {"traj": N × 6 joint angles, "dt": s} or None
 ```
 
-### 1.2 上游請求：`request.json`
+### Many candidate grasps
 
-```json
-{"base_pose_in_map": [2.0, 1.0, 0.5236],
- "grasp_pose_in_map": {"position": [2.797, 1.46, 0.46],
-                       "quaternion_wxyz": [0.354, -0.612, 0.354, 0.612]},
- "target": {"mask_key": "target_mask"}}
-```
-
-| 欄位 | 意義 |
-|---|---|
-| `base_pose_in_map` | Kachaka **現在**的定位 (x, y, yaw)，地圖座標，yaw 是弧度 |
-| `grasp_pose_in_map.position` | 決定好的夾爪位置（`pinch_center`：兩指中間），地圖座標，公尺 |
-| `grasp_pose_in_map.quaternion_wxyz` | 決定好的夾爪朝向，順序 w, x, y, z。`pinch_center` 的 +z 是夾爪前進（接近）方向 |
-| `target`（選填）| 哪些點是目標物，三選一，依優先順序：<br>`{"mask_key": "target_mask"}` → npz 裡那個 bool 欄位（**最準**）<br>`{"class": "can"}` 或 `{"class": 5}` → 這個類別、且在夾爪位置 0.2 m 內的點（同類別但較遠的仍是障礙）<br>不給 → 退路：夾爪位置為中心、半徑 7 cm、上下各 10 cm 的直立圓柱內的點 |
-
-### 1.3 為什麼要知道哪些點是目標物
-
-目標物本身也在點雲裡，而夾爪位姿就在它中間。如果不排除它，它會被包成障礙物，手臂一到夾爪位姿就「撞到」，IK 永遠無解。
-只給夾爪位置時用圓柱退路排除：直立的小物體（罐子、瓶子）可以；物體比圓柱大、或旁邊 7 cm 內有別的東西時不可靠，請給遮罩或類別。
-
-### 1.4 只有點雲（沒有語意分類）也可以
-
-物體互相接觸時（擋板立在桌上、櫃子靠著桌子），沒有分類就會連成一個物體。程式會再依**高度分層**：
-俯視圖每一格取它自己的頂面高度，頂面高度不同的區域（桌面 0.41 m、擋板 0.71 m、櫃子 0.91 m）各自包方塊、往上堆疊，
-不會把整片桌面包到櫃子的高度（`scene_io.py:169 height_levels`）。
-
-在測試場景驗證過（RTX PRO 6000，2026-10-14）：
-
-| 輸入 | 障礙方塊 | 目標物判定 | IK 解 | 選中站位 (map) | 穩健度 |
-|---|---|---|---|---|---|
-| 點雲＋語意＋目標遮罩 | 12 | `slam_mask` | 43 | (3.16, 0.89, 137°) | 0.63 |
-| 點雲＋目標遮罩 | 18 | `slam_mask` | 41 | 同上 | 0.67 |
-| 只有點雲（不給目標） | 24 | `radius_fallback` | 41 | 同上 | 0.67 |
-
-三種輸入選到同一個站位。穩健度都沒到 1.0，是走「用最穩健的」退路選出來的（見 2.2）。
-
----
-
-### 1.5 直接接實驗室的系統（Thor 上的格式）
-
-| 實驗室有的東西 | 怎麼給 | 說明 |
-|---|---|---|
-| 匯出的 3D 語意地圖資料夾（`robot_ws/data/lab/<site>/`）| `--lab-map <資料夾>` | 讀 `*_sem_color_fine.npz`（points）、`*_instance_labels.npz`、`*_instance_semantic_table_fine.json`、`alignment_*.yaml`；依 alignment（object_query 同一套公式）轉到 Kachaka 地圖座標並把地板移到 z = 0（`lab_map.py`）|
-| Kachaka 的 2D 地圖 `occupancy_<site>.yaml/png` | 和 `--lab-map` 一起自動讀，或 `--occupancy <yaml>` | 站位只能落在它的 free 格子上（3D 點雲常常沒有地板點）；Stage1 用的也是這張 |
-| object_query 的實例編號 | `"target": {"instance_id": 13}` | 該實例的點就是目標物 |
-| 夾爪位姿在 Piper 基座座標（mm_actions 的慣例）| `"grasp_pose_in_piper_base": {...}` 取代 `grasp_pose_in_map` | 用 `base_pose_in_map` 和安裝位置換到地圖座標（同 `piper_point_to_kachaka`）|
-| 類別表 `{"segmentation": [...]}` 或 `{"labels": [...]}` | 自動判斷 | `scene_io.load_class_names` |
-
-在 803 室 9/30 地圖上的實測（夾爪位姿為手動標註，見 `real_maps/map803_0930/requests/`，不在本專案內）：瓶子 19 成功、穩健度 1.00；
-瓶子 13 成功但穩健度 0.11（夾爪離桌面方塊只剩 3 mm；加了 `min_accept: 0.5` 之後會改回 `not_robust`，尚未重跑）；瓶子 24 在後排被前排瓶子與紙箱圍住，夾爪本身在任何抓法下都會碰到，無解。
-
-## 2. 輸出
-
-`run_demo.py` 印出一行 `@@JSON@@{…}`。上游只要先看 `ok` 和 `reason`。
-
-### 2.1 欄位
-
-| 欄位 | 意義 |
-|---|---|
-| **`ok`** | true = 找到站位 |
-| **`reason`** | `ok`，或沒有結果時卡在哪一步（見 2.3） |
-| **`chosen_map`** | **(x, y, yaw) 地圖座標 → 直接給 Kachaka `Navigate_to_pose`**（只有 `ok` 時才有） |
-| `chosen_base` | 同一個站位，相對於現在位置（base 座標）的移動量 |
-| **`at_goal.grasp_pose_in_piper_base`** | 站在 `chosen_map` 時，上游的夾爪位姿在 Piper 基座座標的值 → 可直接給 mm_actions 的 `move_arm_to_pose` |
-| `robustness` | 選中站位的穩健度：假設 Kachaka 停歪 ±5 cm、±5°（27 種），手臂還抓得到的比例 |
-| `below_threshold` | true = 沒有站位達到 `threshold`，選中的是退路（見 2.2） |
-| `max_robustness` | 評過分的站位中最高的穩健度（`not_robust` 時看差多少） |
-| `timing_s`、`memory_mb` | 每一步耗時（秒）與 GPU 記憶體（MB） |
-| `n_boxes`、`boxes_base` | 從點雲算出的障礙方塊（base 座標） |
-| `target_points`、`target_source` | 排除了幾個目標物的點、用哪種方式（`slam_mask` / `class_near_grasp` / `radius_fallback`）|
-| `known_source` | 可停車區域的依據：`occupancy`（Kachaka 2D 地圖）或 `slam_points` |
-| `n_success`、`n_cone`、`parked_ok`、`n_checked` | 每一步剩下多少候選：IK 解數、護欄內的解數、每個候選能不能停、評過分的站位數 |
-| `q_success`、`uniq`、`rob` | 中間結果（候選站位、評分），除錯與可視化用 |
-
-### 2.2 穩健度門檻：`threshold` 和 `min_accept`（`config.yaml` 的 `robustness`）
-
-1. 由近到遠評分，第一個穩健度 ≥ `threshold`（預設 1.0，27 種全過）的站位就採用。
-2. 沒有站位達到 `threshold` 時，採用評過分的站位中最穩健的（同分取最近），但不能低於 `min_accept`（預設 0.5），
-   `below_threshold = true`。
-3. 都沒有就 `ok = false`、`reason = not_robust`，不會把只有一兩種擾動抓得到的站位當成功回傳。
-
-所以不需要手動把 `threshold` 降到 0.9：退路會自動拿到這個場景最高的分數，`min_accept` 決定最低能接受多少。
-
-### 2.3 `reason`：沒有結果時卡在哪一步
-
-程式每一步都有上限（IK 最多 `wb_rounds_max` 輪、只評有限個候選、退路只試 ≥ `min_accept` 的），不會一直算下去。
-`reason` 是**第一個把候選篩光的步驟**：
-
-| reason | 意思 | 上游可以怎麼做 |
-|---|---|---|
-| `ok` | 找到站位 | 導航到 `chosen_map` |
-| `no_ik_solution` | 搜尋範圍內沒有任何 9 軸 IK 解：搆不到，或夾爪位姿本身就碰撞 | 換抓法 |
-| `outside_cone` | 有解，但都超出 ±30° 護欄（`robot.bearing_limit_rad`） | 換抓法，或放寬護欄 |
-| `cannot_park` | 有解，但底盤停的位置都不在可行駛區域（Kachaka 2D 地圖或 SLAM 看過的地板） | 檢查地圖，或換抓法 |
-| `not_robust` | 停得進去，但穩健度都低於 `min_accept`；看 `max_robustness` 差多少 | 冒險降 `min_accept`，或換抓法 |
-
-注意：
-- `no_ik_solution` 是取樣沒找到（128 種子 × 最多 4 輪），不是證明無解；解空間很窄時可能漏掉。
-  「夾爪本身碰撞」目前也歸在這裡，還沒有分開判斷。
-- 底盤的碰撞球在 9 軸 IK 裡就已經檢查過（`robot_model.py:92`），所以地上有障礙物時通常是 `no_ik_solution`；
-  `cannot_park` 實際上只會來自可行駛區域的檢查。
-
-每一種 reason 都用場景驗證過，見第 8 節。
-
-### 2.4 到位後：手臂軌跡是另一個步驟
-
-`plan()` 只回答「要移到哪裡」，**不做手臂軌跡規劃**。Kachaka 到位、上游用鏡頭重新確認目標的座標之後，
-用**實際到達的位置**和新的夾爪位姿送一個新請求，只規劃手臂：
+[`demo_multi_grasp.py`](demo_multi_grasp.py) runs this whole flow for one capture with N grasps (the executed one, the
+best GraspGen candidates, and one deliberately impossible grasp 2 m up in the air), rejects the impossible ones with a
+reason, and picks one:
 
 ```bash
-python run_demo.py --lab-map <map> --request arrived.json --arm      # 或 --serve 時那一行加 "arm": true
+python demo_multi_grasp.py --lab-map <map dir> --run <Grasp Lab run dir> [--top 8] [--first] [--drop-stale]
 ```
 
-程式裡是 `planner.set_scene(新場景)` 再 `planner.plan_arm()`（底盤鎖在現在的位置，6 軸 MotionPlanner 從收起姿態開始）。
-輸出 `arm.traj`（N × 6，joint1–6，弧度）、`arm.dt`；規劃不出來時 `reason = arm_plan_failed`，可以檢查 `robot.stow_arm` 或重試。
-MotionPlanner 在第一次呼叫時才建立（約 2–3 s）；`profile.build_arm_planner: true` 則在啟動時就建好。
+Output on the Thor (map803_0930, run 20261008_045944_bottle):
 
----
-
-## 3. 怎麼跑
-
-### 建構環境（x86_64 + NVIDIA GPU，第一次）
-
-用 [uv](https://docs.astral.sh/uv/) 建一個 Python 3.12 的虛擬環境。以下步驟在 RTX PRO 6000（CUDA 12.8 驅動）上從零跑過：
-
-```bash
-uv venv --python 3.12 ~/env_curobo
-source ~/env_curobo/bin/activate
-
-# 1. PyTorch（CUDA 12.8 版）
-uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-
-# 2. cuRobo v2，固定在這個專案測過的 commit
-git clone https://github.com/NVlabs/curobo.git
-git -C curobo checkout 4ea7736
-uv pip install "./curobo[cu12]"
-
-# 3. 這個專案自己的相依
-uv pip install -r requirements.txt
-
-# 檢查：應印出 0.8.0 2.11.0+cu128 True
-python -c "import curobo, torch; print(curobo.__version__, torch.__version__, torch.cuda.is_available())"
+```
+executed               drive to (2.36, 0.32, 68°), 0.02 m away, robustness 27/27    scene 0.62 s + plan 0.36 s
+graspgen0              REJECTED: no_ik_solution                                     scene 0.17 s + plan 1.51 s
+graspgen2              drive to (2.93, 0.28, 137°), 0.54 m away, robustness 27/27   scene 0.18 s + plan 0.80 s
+graspgen3              drive to (2.56, 0.17, 77°), 0.22 m away, robustness 15/27 (fallback) scene 0.18 s + plan 7.23 s
+graspgen5              REJECTED: not_robust                                         scene 0.19 s + plan 6.65 s
+impossible (2 m up)    REJECTED: no_ik_solution                                     scene 0.16 s + plan 1.48 s
+...
+picked: executed → drive to (2.364, 0.317, 1.18)
+startup: planner 14.2 s, SLAM map 0.007 s (once) | capture merge 0.19 s | 10 grasps: 29.9 s in all, median 1.67 s each
 ```
 
-- 驅動是 CUDA 13 的話，第 1 步換成 cu13 的 PyTorch，第 2 步用 `"./curobo[cu13]"`（見 cuRobo 的 `docs/getting-started/installation.rst`）。
-- Jetson Thor（aarch64）要用 NVIDIA 給 Jetson 的 PyTorch，不能直接照上面裝；cuRobo 部分相同。
-- 第一次執行會編譯 warp kernel，比之後慢。
+How to pick (`pick()` in the demo; a simple rule, still to be agreed with upstream): a station that survives every
+navigation error first, then the most robust, then the shortest drive, then upstream's own grasp confidence.
 
-### 有 cuRobo + GPU 的機器（Thor、工作站）
+Trying all N is slow when some grasps only have weak stations (5–7 s each). In practice, try the grasps in upstream's
+confidence order and **stop at the first 27/27** (`--first`): here that is the first grasp, about 1 s.
+
+### From the command line
 
 ```bash
 python run_demo.py                                                   # test_maps/slam.npz + test_maps/request.json
-python run_demo.py --npz /maps/xxx.npz --request request.json
-# 常駐：solver 只在啟動時建一次（Thor 約 14 s），之後每行一個請求（request.json 路徑，或請求本身的 JSON，
-# 可帶 "lab_map" / "npz" / "occupancy" 換地圖，地圖只讀一次），每個請求印一行 @@JSON@@
-python run_demo.py --lab-map /maps/auto_20260826 --serve < requests.txt
+python run_demo.py --npz map.npz --request request.json              # one request, solvers built for it
+python run_demo.py --lab-map /maps/map803_0930 --request request.json
+python run_demo.py --lab-map /maps/map803_0930 --serve < requests.txt   # long-running, see §2
+python run_demo.py --lab-map /maps/map803_0930 --request arrived.json --arm   # arm trajectory only (after arriving)
 ```
 
-### 放到系統上：常駐一次，請求只付自己的時間
+Every request prints one line `@@JSON@@{...}` (§4).
 
-建規劃器（cuRobo 的所有 solver、暖機）在 Thor 上要 **約 14 s**，整理一張 SLAM 地圖第一次要 **約 4 s**。這兩件事都只在系統啟動時做一次，
-**不要每個請求重建**；之後每個請求只把障礙物寫進已經建好的 solver。
+---
 
-| 時機 | 做什麼 | Thor 實測 |
+## 2. Deploying on the robot
+
+Run it as **one long-running process**. Building the solvers (~14 s on the Thor) and processing a SLAM map the first
+time (~3.8 s) happen once at startup; each request then only writes its obstacles into the existing solvers.
+
+| When | What | Thor |
 |---|---|---|
-| 系統啟動（一次） | `planner = BasePlacementPlanner(cfg)` | ~14 s |
-| 系統啟動（每張地圖一次） | `slam, names, _ = load_lab_map(map_dir)`：第一次整理後存到 `.map_cache/`（`$CUROBO_MAP_CACHE` 可改位置），之後直接讀 | 第一次 ~3.8 s，之後 ~7 ms |
-| 每次手腕拍照 | `world = grasp_lab.fuse(cfg, slam, cap, names)`（學長的合併地圖到了之後改讀那份） | ~0.19 s |
-| 每個候選抓取 | `scene_from_slam(world, …)` → `planner.set_scene(scene)` → `planner.plan()` | 0.18 s ＋ 0.3–0.8 s（有 27/27 站位）；無解 ~1.5 s；退路 5–7 s |
-| 到位後（需要時） | 重新拍照 → `set_scene` → `planner.plan_arm()` | ~0.3 s |
+| startup, once | `planner = BasePlacementPlanner(cfg)` | ~14 s |
+| startup, once per map | `load_lab_map(map_dir)`: processed once, saved to `.map_cache/` (`$CUROBO_MAP_CACHE` to move it), read afterwards | ~3.8 s first time, then ~7 ms |
+| per wrist capture | `grasp_lab.fuse(...)` (later: read the teammate's merged map instead) | ~0.19 s |
+| per candidate grasp | `scene_from_slam(...)` → `set_scene(scene)` → `plan()` | 0.18 s + 0.3–0.8 s (27/27 station); ~1.5 s impossible; 5–7 s fallback |
+| after arriving, when needed | new capture → `set_scene` → `plan_arm()` | ~0.3 s |
 
-兩種接法：
-1. **Python 直接呼叫**（實驗室的程式和這裡同一個行程）：照 `demo_multi_grasp.py` 的 `start()` / `merge()` / `solve()` / `pick()`。
-2. **另一個常駐行程**：`python run_demo.py --serve`，stdin 每行一個請求（`request.json` 路徑或請求本身的 JSON，可帶 `"lab_map"` / `"npz"` /
-   `"occupancy"` 換地圖），stdout 每個請求一行 `@@JSON@@{…}`；啟動完成時 stderr 印 `ready (setup …s)`。之後要接 ROS 2 service，就是把這個迴圈換成 service callback。
+Two ways to connect:
 
-Thor 上的啟動指令（實驗室的 `mm-gpu:latest` 映像；warp kernel 的編譯快取要掛出來，否則每次啟動都重新編譯）：
+1. **In-process Python calls** (the lab's code imports this package): exactly §1, or `start()` / `merge()` / `solve()` /
+   `pick()` in `demo_multi_grasp.py`.
+2. **A separate service process**: `python run_demo.py --serve` reads one request per stdin line (a `request.json` path or
+   the request itself as JSON; optional keys `"lab_map"`, `"npz"`, `"occupancy"` switch maps, each map is read once,
+   `"arm": true` plans the arm instead). It prints `ready (setup …s)` on stderr once the solvers are built and one
+   `@@JSON@@{...}` line per request on stdout. A ROS 2 service would replace this stdin loop with a service callback.
+
+On the Thor, inside the lab's `mm-gpu:latest` image (cuRobo is already installed there). Mount warp's kernel cache, or
+every start recompiles the kernels:
 
 ```bash
 cd ~/curobo-base-placement
@@ -222,358 +160,381 @@ docker run -d --name base_placement --restart unless-stopped --runtime nvidia --
   --entrypoint bash mm-gpu:latest -c "python3 run_demo.py --lab-map /maps/map803_0930 --serve"
 ```
 
-注意：
-- 呼叫這些函式的腳本要有 `if __name__ == "__main__":`：切方塊用多個 CPU 行程（`map.box_workers`），沒有的話會退回單核心（結果相同、較慢）。
-  每個行程的第一個請求建場景較慢（~0.6 s），因為要啟動這些行程。
-- GPU 記憶體：所有 solver 常駐約 0.5 GB。容量固定（`profile.max_scene_boxes`、`max_near_boxes`、ESDF 範圍），請求超過會報錯而不是偷偷丟障礙物。
-- 一次要試很多個抓取：照上游的信心分數依序試、第一個 27/27 就停（`demo_multi_grasp.py --first`）比全部試完再挑快很多：Thor 上 10 個全試 30 s，
-  大部分花在只有較弱站位的抓取上。
-
-### 從沒有 GPU 的電腦丟到 server 跑（server 上不留任何檔案）
-
-```bash
-python bundle.py | ssh <server> 'cd /tmp && <cuRobo 環境的 python> -'
-python bundle.py --npz /maps/xxx.npz --request request.json | ssh <server> '…'
-```
-
-`bundle.py` 把程式、config、`assets/` 的 yml 與 URDF、輸入檔打包成一支腳本，在 server 的 `/dev/shm` 解開執行，跑完自動刪除。
-
-### 相依
-
-- cuRobo v2（[NVlabs/curobo](https://github.com/NVlabs/curobo)，commit `4ea7736` "cuRoboV2 research release"，0.8.0）＋ PyTorch（CUDA）
-- `requirements.txt`：numpy、scipy、PyYAML
-- 機器人資產已在 `assets/`（不用連到外部路徑）
+Notes:
+- Scripts that call these functions need `if __name__ == "__main__":`. Box fitting runs in a pool of CPU processes
+  (`map.box_workers`); without the guard it falls back to one core (same result, slower). The first request of a
+  process builds its scene more slowly (~0.6 s) because the pool starts then.
+- GPU memory: all solvers together stay resident at about 0.5 GB. Capacities are fixed (`profile.max_scene_boxes`,
+  `max_near_boxes`, the ESDF box); a request that exceeds them fails loudly instead of silently dropping obstacles.
+- Running from a laptop without a GPU: `python bundle.py | ssh <server> 'cd /tmp && <cuRobo python> -'` packs the code,
+  config, robot assets and inputs into one script that unpacks to `/dev/shm` on the server and deletes itself afterwards.
 
 ---
 
-## 4. 檔案
+## 3. Inputs
+
+### 3.1 The SLAM point cloud: `.npz`
+
+| Field | Shape / type | Required | Use |
+|---|---|---|---|
+| `means3D` | (N, 3) float32, metres | **yes** | point positions in the **map frame** (the frame Kachaka localises in), z up, floor at z ≈ 0 |
+| `semantic_ids` | (N,) uint8 | no | class id per point; objects are first separated by class (works without, §5.1) |
+| target mask (any name, e.g. `target_mask`) | (N,) bool | recommended | the **target object's points**: they are what is grasped, never an obstacle |
+| `logit_opacities` | (N, 1) | no | 3D Gaussian opacity; only points with > 0 are used |
+| `<same name>.json` | `{"0": "floor", "1": "table", …}` | no | class names, so a request may name a class |
+
+No obstacle boxes, obstacle lists or grids are needed: obstacles are computed from the points (§5.1). Every point
+above the floor, within 1.8 m of the gripper and not part of the target is an obstacle. Other formats (PLY, PCD,
+PointCloud2) only need converting:
+
+```python
+np.savez("map.npz", means3D=xyz.astype(np.float32))                          # minimum
+np.savez("map.npz", means3D=xyz.astype(np.float32), target_mask=is_target)   # recommended
+```
+
+### 3.2 The request
+
+```json
+{"base_pose_in_map": [2.0, 1.0, 0.5236],
+ "grasp_pose_in_map": {"position": [2.797, 1.46, 0.46], "quaternion_wxyz": [0.354, -0.612, 0.354, 0.612]},
+ "target": {"mask_key": "target_mask"}}
+```
+
+| Field | Meaning |
+|---|---|
+| `base_pose_in_map` | where Kachaka is **now**: (x, y, yaw), map frame, yaw in radians |
+| `grasp_pose_in_map.position` | the decided gripper position (`pinch_center`, between the two fingers), map frame, metres |
+| `grasp_pose_in_map.quaternion_wxyz` | the decided gripper orientation, w, x, y, z; `pinch_center`'s +z is the approach direction |
+| `grasp_pose_in_piper_base` | alternative to `grasp_pose_in_map`, as mm_actions uses it: the same pose in the Piper base frame of the robot standing at `base_pose_in_map` |
+| `target` (optional) | which points are the target, in order of preference: `{"mask_key": "target_mask"}` (a bool field of the npz, **best**); `{"instance_id": 13}` (lab maps); `{"class": "can"}` (that class within 0.2 m of the gripper; farther ones stay obstacles); omitted → an upright cylinder of radius 7 cm, ±10 cm around the gripper (fine for a small upright can or bottle, unreliable otherwise) |
+
+Why the target matters: it is in the point cloud and the gripper pose is inside it. Not excluded, it becomes an
+obstacle and the gripper "collides" at the goal, so IK never succeeds.
+
+### 3.3 The lab's data on the Thor
+
+| What the lab has | How to give it | Notes |
+|---|---|---|
+| exported 3D semantic map folder (`robot_ws/data/lab/<site>/`) | `--lab-map <dir>` / `lab_map.load_lab_map(dir)` | reads `*_sem_color_fine.npz`, `*_instance_labels.npz`, `*_instance_semantic_table_fine.json`, `alignment_*.yaml`; applies that alignment (the object_query formula) and moves the floor to z = 0 |
+| Kachaka's 2D map `occupancy_<site>.yaml/png` | read automatically with `--lab-map`, or `--occupancy` | the base may only park on its free cells (3D maps often lack floor points); Stage1 uses the same map |
+| object_query instance ids | `"target": {"instance_id": 13}` | |
+| Grasp Lab Global captures (`main_ws/grasp_logs/<run>/`) | `grasp_lab.py` | §8 |
+
+---
+
+## 4. Outputs
+
+`run_demo.py` prints one line `@@JSON@@{...}`; `plan()` returns the same dict. Check `ok` and `reason` first.
+
+| Field | Meaning |
+|---|---|
+| **`ok`** | true = a station was found |
+| **`reason`** | `ok`, or the first step that ran out of candidates (table below) |
+| **`chosen_map`** | **(x, y, yaw), map frame → `Navigate_to_pose`** (only when `ok`) |
+| `chosen_base` | the same station relative to where Kachaka is now |
+| **`at_goal.grasp_pose_in_piper_base`** | the gripper pose in the Piper base frame once Kachaka stands at `chosen_map` → mm_actions `move_arm_to_pose` (`run_demo.py` adds it) |
+| `robustness` | fraction of the 27 navigation errors (±5 cm, ±5°) from which the arm still reaches the pose |
+| `below_threshold` | true = no station reached `threshold`; this is the fallback (below) |
+| `max_robustness` | best robustness among the scored stations (how far off a `not_robust` was) |
+| `timing_s`, `memory_mb` | time per step (s), GPU memory (MB) |
+| `n_boxes`, `boxes_base`, `target_points`, `target_source`, `known_source` | the obstacles built, how the target was found, what defined the drivable area |
+| `n_success`, `n_cone`, `parked_ok`, `n_checked`, `q_success`, `uniq`, `rob` | candidates left after each step and their scores (debugging, plots) |
+
+**Threshold and fallback** (`robustness.threshold`, `min_accept`):
+1. Stations are scored nearest first (the current pose first of all); the first with robustness ≥ `threshold`
+   (1.0 = all 27) is taken.
+2. If none reaches it, the most robust scored station is taken (nearest on ties) as long as it reaches `min_accept`
+   (0.5); `below_threshold = true`.
+3. Otherwise `ok = false`, `reason = not_robust`. A station that only survives one or two errors is never returned.
+
+**`reason`** — the first step that removed every candidate:
+
+| reason | Meaning | What upstream can do |
+|---|---|---|
+| `ok` | a station was found | drive to `chosen_map` |
+| `no_ik_solution` | no 9-DoF IK solution in the search window: out of reach, or the gripper pose itself collides | another grasp |
+| `outside_cone` | solutions exist, but none keeps the target within the arm's ±30° safety cone (`robot.bearing_limit_rad`) | another grasp, or widen the cone |
+| `cannot_park` | solutions exist, but the base can never park there (blocked, or off Kachaka's free cells) | check the map, or another grasp |
+| `not_robust` | parkable, but no station reaches `min_accept`; see `max_robustness` | lower `min_accept` at your own risk, or another grasp |
+| `arm_plan_failed` | only from `plan_arm()`: no arm trajectory from the stowed arm | check `robot.stow_arm`, retry |
+
+`no_ik_solution` means sampling found nothing (128 seeds × up to 4 rounds), not a proof; a very narrow solution space
+can be missed. A colliding gripper pose is also reported this way for now.
+
+**The arm trajectory is a separate step.** `plan()` only answers where to drive. Once Kachaka has arrived and upstream
+has looked at the target again, send a new request with the pose actually reached: `set_scene(new scene)` then
+`plan_arm()` (base locked, 6-DoF MotionPlanner from the stowed arm). It returns `{"traj": N × 6 (joint1–6, rad), "dt"}`
+or `None`. The MotionPlanner is built on the first call (~2–3 s) unless `profile.build_arm_planner: true`.
+
+---
+
+## 5. How it works
 
 ```
-curobo_base_placement/
-├─ config.yaml        ← 所有假設值與參數（量到實際數值只改這裡）
-├─ run_demo.py        ← 入口：讀點雲與請求 → 規劃 → 印出 JSON
-├─ scene_io.py        ← 點雲 + 請求 → 規劃器要的格式（障礙方塊、已知區域、base 座標的夾爪位姿）
-├─ robot_model.py     ← 9 軸 cuRobo 模型（Kachaka x, y, ψ + Piper 6 軸）
-├─ placement.py       ← 找站位並確認抓得到
-├─ bundle.py          ← 打包成一支腳本丟到 server 跑
-├─ make_test_maps.py  ← 從 test_scene.yaml 做出測試用的點雲與請求
-├─ test_scene.yaml、test_maps/   ← 測試場景（桌上罐子前有擋板、左邊櫃子、後方與右方是牆）
-├─ validation/       ← 驗證與效能測試（獨立資料夾，主程式不引用；見第 8 節與 validation/README.md）
-└─ assets/            ← robot129.yml（cuRobo 設定、碰撞球）、robot129_description/（URDF、STL）
-```
-
-## 5. 資料流（檔案:行號）
-
-```
-slam.npz + request.json（map 座標）   或   --lab-map 實驗室匯出資料夾（lab_map.py）
-   │ scene_io.py:330 scene_from_slam()
-   │   :383 目標物點（遮罩 / instance id → 類別 → 圓柱退路，再往外長 3 cm）   :367 已知區域（或 :317 Kachaka 2D 地圖）   :402 障礙點
-   │   :237 objects_to_boxes()  依類別 → 3D 連通物體 → :216 依高度分層 → :171 decompose() 包方塊（不填目標物的位置）
+SLAM npz / lab map folder  (+ wrist capture: grasp_lab.fuse)
+   │ scene_io.scene_from_slam(): target points, drivable area, obstacle points
+   │   far from the gripper: objects_to_boxes()  (per class → 3D-connected objects → height levels → boxes)
+   │   within ±25 cm of the gripper: esdf_grid() (1 cm signed distance field)
    ▼
-PlanningScene（base 座標 = Kachaka 現在的位置）
-   │ placement.py BasePlacementPlanner(cfg)   開機時建好 solver；每個請求 set_scene(scene) 只把方塊寫進 tensor
-   │ placement.py plan()
-   │   1 whole_body()   9 軸 IK：同一個夾爪位姿 → 很多候選站位 (x, y, ψ)
-   │   2 _candidates()  ±30° 護欄（robot_model.in_safety_cone）＋ parking_ok() 底盤不撞、在可行駛區域
-   │   3 _lm_pass() / _finish()   由近到遠，27 種到位誤差各重解 6 軸 IK（先 LM，需要時才最佳化）；
-   │                    第一個 27/27 的就是答案（都沒有時用最穩健的，但不低於 min_accept）
+PlanningScene (base frame = where Kachaka is now)
+   │ BasePlacementPlanner.set_scene(): obstacles written straight into the resident solvers' tensors
+   │ BasePlacementPlanner.plan():
+   │   1 whole_body()     9-DoF IK, one gripper pose → many candidate stations (x, y, yaw)
+   │   2 _candidates()    ±30° safety cone; parking_ok(): base clear of obstacles and on drivable cells;
+   │                      the current pose is added as the nearest candidate
+   │   3 _lm_pass(), _finish()   each station: 27 navigation errors, 6-DoF IK each (cheap LM stage for all,
+   │                      the expensive optimiser only where it can change the answer); first 27/27 wins
    ▼
-chosen_map → Navigate_to_pose；at_goal.grasp_pose_in_piper_base → 到位後的手臂
-   │ 到位、重新確認目標後（另一個步驟）：set_scene(新場景) → plan_arm() → arm.traj
+chosen_map → Navigate_to_pose          (later, separately: set_scene(new scene) → plan_arm() → arm trajectory)
 ```
 
-| 座標系 | 定義 | 轉換 |
-|---|---|---|
-| map | SLAM／Kachaka 地圖 | 輸入檔案都在這裡 |
-| base | Kachaka **現在**的位置：底盤中心投影到地面，x 朝車頭、z 朝上 | `scene_io.py:32 map_to_base_xy`、`:49 quat_map_to_base`、`:43 base_to_map_pose`（輸出給導航）|
+### 5.1 From points to obstacles
 
-## 6. 量到實際數值要改哪裡（`config.yaml`）
+- **Target**: from the mask / instance / class / cylinder (§3.2), grown by 3 cm (`map.target_grow_m`) within the
+  target's height range, because segmentation is never exact at the object's edge.
+- **Boxes** (everything beyond the ESDF region): points are grouped per class into 3D-connected objects (4 cm voxels);
+  each object's footprint is split into **height levels** (a table top at 0.41 m, a board on it at 0.71 m, a cabinet
+  at 0.91 m each get their own stacked boxes instead of one block at the tallest height), then covered with few
+  rectangles (`decompose`). Boxes are inflated 1 cm horizontally and 0.5 cm vertically. Nothing is filled inside the
+  target's footprint above its bottom (`keep_out`). Box fitting runs in parallel per object (identical result).
+- **ESDF near the gripper** (`map.esdf_half_m`, default 0.25 m): boxes on a 4 cm grid fill the gap between, say, a
+  carton's floor and its back wall; within 50 × 50 × 70 cm of the target they claim 8–33% of the free space
+  (measured, §9.4), and the fingers pass within 1–3 cm of the clutter. So within ±0.25 m × ±0.25 m × ±0.35 m of the
+  gripper (above 0.15 m; lower obstacles stay boxes for the parking check) the points become a 1 cm signed distance
+  field (cuRobo v2 `VoxelData`, float16, negative inside). Every 1 cm column is filled from its lowest to its highest
+  point, cut at vertical gaps over 5 cm; the target's footprint is kept free as for the boxes; distances are reduced by
+  0.5 cm. Boxes and the grid are evaluated together in the same collision kernel.
 
-| 量到的東西 | 欄位 | 進到程式的哪裡 |
-|---|---|---|
-| 手臂裝在 Kachaka 的位置 | `robot.arm_mount_xyz`、`arm_mount_rpy_deg` | `robot_model.py:91`（運動鏈）、`:133`（護欄）|
-| Kachaka 實際尺寸 | `robot.kachaka.size_m` | 碰撞球、停車檢查 |
-| 相機桿等凸出物 | `robot.kachaka.extra_spheres` | 碰撞球 |
-| 開車時手臂收起的姿態 | `robot.stow_arm`（目前用實驗室 mm_actions 的 home 姿態：全零）| 停車檢查、手臂規劃起點 |
-| Kachaka 到位誤差 | `robustness.perturb_xy_m`、`perturb_yaw_deg` | 27 種擾動 |
-| 夾爪位姿指的 frame | `robot.tool_frame` | 必須和上游給位姿時用的 frame 一致 |
-| 點雲轉方塊 | `map.*`（體素、分層、方塊填滿率、目標物半徑） | `scene_io.py` |
+![boxes vs ESDF](docs/media/esdf_vs_boxes.png)
 
-安裝偏移怎麼量：手臂 joint1 轉軸與 Kachaka 頂面的交點 → 到底盤中心的前後距離 = x、左右 = y（左正）、頂面離地 = z。
+*The executed grasp, sliced through the gripper: the boxes (left) fill both sides of the bottle; the ESDF (right) keeps
+only the carton floor as an obstacle.*
 
-## 7. 已知限制
+### 5.2 Search and scoring
 
-- 手臂安裝位置 (0.08, 0, 0.525)、Kachaka 車身（0.387 × 0.240 × 0.095 m，中心在轉軸前 4.35 cm）、工具點（gripper_base 前 0.12 m）
-  取自實驗室的 `kachaka_piper.urdf.xacro` 與 mm_actions。底盤上方撐起手臂的支架（和車身同樣大小、到 0.525 m）不建模：
-  底盤只問「能不能停」（底盤的碰撞球 + Kachaka 2D 地圖），碰撞只在規劃手臂時檢查。右側相機桿尚未加入；到位誤差 ±5 cm／±5° 是假設值。
-- 收起姿態用 mm_actions 夾到東西後的姿態；空手的 home（全零）完全折疊，robot129 的碰撞球在那裡重疊，cuRobo 會拒絕當起點。
-- 需確認：SLAM 與 Kachaka 用同一張地圖座標、地板在 z ≈ 0；上游夾爪位姿用的 frame 是 `pinch_center`。
-- 點雲轉出的方塊比實物大約 1–2 cm（含安全餘量）；桌下等懸空空間會被當成實心。
-- 穩健度用 8 個 IK 種子評分（見第 9 節），每次執行仍可能有小幅跳動；可調 `profile.scorer_seeds`、`robustness.threshold` 或 `robustness.min_accept`。
-- 停車檢查只用底盤的 10 顆球，直接用 numpy 算到方塊的距離（`placement.py:141`）；cuRobo v2 這個版本的 `collision_checking.validate()` 有 bug，沒有使用。
-- 時間見第 9 節（Thor + 實驗室真實地圖）。
+- **Whole-body IK**: 128 seeds over base (x, y, yaw) within ±1.5 m of the current pose and the 6 arm joints, all at
+  once for the one gripper pose; more rounds (up to 4) if fewer than 15 parkable candidates come back.
+- **Filtering**: target within the arm's ±30° safety cone; base spheres clear of the boxes and the footprint on
+  drivable cells (Kachaka's 2D map); the current pose is added as a candidate, so a robot that already stands well
+  does not move.
+- **Robustness**: Kachaka never stops exactly. Each candidate is re-solved as a 6-DoF IK at 27 perturbed base poses
+  (every combination of −5/0/+5 cm in x and y and −5/0/+5° in yaw); robustness = the fraction that still reaches the
+  pose. Each perturbation has its own copy of the obstacles (cuRobo multi-env), written in closed form.
+- **Speed**: only obstacles the arm can reach from a station are loaded (a provable 0.887 m bound around the shoulder;
+  farther ones contribute exactly zero). IK runs in two stages: Levenberg–Marquardt (cheap) for every station first,
+  then the MPPI + L-BFGS optimiser (99% of the cost) only for perturbations LM left unsolved, and only for stations that
+  can still change the answer. Any valid solution from either stage counts.
 
-## 8. 驗證場景
+### 5.3 Frames
 
-把測試場景（`test_maps/`）改掉一個條件，確認每一種 `reason` 都在該出現的地方出現：
+| Frame | Definition |
+|---|---|
+| map | the SLAM / Kachaka map; every input file is in it |
+| base | Kachaka **now**: centre of the turning axis on the floor, x forward, z up; planning happens here (`scene_io.map_to_base_xy`, `quat_map_to_base`, `base_to_map_pose`) |
+| Piper base | the arm's `base_link`, mounted at (0.08, 0, 0.525) m in the base frame |
+
+---
+
+## 6. Installation
+
+On an x86_64 machine with an NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) (tested from scratch on an RTX PRO 6000, CUDA 12.8 driver):
 
 ```bash
-python validation/run_scenarios.py                    # 全部場景，每個印 PASS / FAIL
-python validation/run_scenarios.py no_drivable_area   # 只跑指定的
+uv venv --python 3.12 ~/env_curobo && source ~/env_curobo/bin/activate
+uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128   # 1. PyTorch
+git clone https://github.com/NVlabs/curobo.git && git -C curobo checkout 4ea7736  # 2. cuRobo v2 (0.8.0)
+uv pip install "./curobo[cu12]"
+uv pip install -r requirements.txt                                                # 3. numpy, scipy, PyYAML, Pillow
+python -c "import curobo, torch; print(curobo.__version__, torch.__version__, torch.cuda.is_available())"   # 0.8.0 2.11.0+cu128 True
 ```
 
-`validation/` 是獨立的測試資料夾：主程式不引用它，改動只在記憶體裡做（改 config 的值、移動夾爪位姿、把可行駛區域挖掉），
-不改 `config.yaml` 或 `test_maps/`。不用的話可以整個忽略。各程式的說明見 `validation/README.md`。
+- With a CUDA 13 driver, use the cu13 PyTorch and `"./curobo[cu13]"`.
+- On the Jetson Thor (aarch64), use the lab's `mm-gpu:latest` docker image, which already has cuRobo (§2).
+- The first run compiles warp kernels and is slower.
+- The robot assets (`robot129.yml`, URDF, meshes) are in `assets/`.
 
-結果（RTX PRO 6000，2026-10-14，9/9 通過）：
+---
 
-| 場景 | 改了什麼 | reason | IK 解 | 護欄內 | 可停 | 穩健度（選中 / 最高） |
-|---|---|---|---|---|---|---|
-| `baseline` | 不改 | `ok`（退路） | 43 | 33 | 30 | 0.67 / 0.67 |
-| `loose_threshold` | `threshold` 降到 0.5 | `ok`（直接達標） | 43 | 33 | 30 | 0.59 / 0.59 |
-| `unreachable` | 夾爪位姿抬到離地 2.0 m | `no_ik_solution` | 0 | 0 | 0 | – |
-| `gripper_in_cabinet` | 夾爪位姿放進櫃子裡（夾爪本身一定碰撞） | `no_ik_solution` | 0 | 0 | 0 | – |
-| `cone_closed` | 護欄收到 ±0°（強制觸發這個分支） | `outside_cone` | 181 | 0 | 0 | – |
-| `no_drivable_area` | 目標 1.2 m 內都標成不可行駛 | `cannot_park` | 181 | 123 | 0 | – |
-| `sloppy_navigation` | 到位誤差假設成 ±15 cm、±15° | `not_robust` | 43 | 33 | 30 | – / 0.26 |
-| `arm_plan` | 不改；選好站位後另外呼叫 `plan_arm()` | `ok` | 43 | 33 | 30 | 0.67 / 0.67 |
-| `bad_stow` | 收起姿態設成全零（碰撞球自我重疊），另外呼叫 `plan_arm()` | `arm_plan_failed` | 43 | 33 | 30 | 0.67 / 0.67 |
+## 7. Configuration (`config.yaml`)
 
-- `loose_threshold` 評了 4 個站位就停（由近到遠，第一組就有達標的），其他場景評完全部 30 個。
-- IK 解 181 的兩個場景：可停的候選一直不到 `min_candidates`（15 個），所以 IK 跑滿 `wb_rounds_max`（4 輪）才停。
-- `bad_stow` 會印出 cuRobo 的 `Start or End state in collision`，是預期的。
-- 穩健度每次執行會跳動，數字可能和上表差一點，但 reason 應該一樣。
+Everything measurable lives in `config.yaml`; when you measure the real value, change only this file.
 
-
-## 9. 在 Thor 上用真實地圖：加速與驗證
-
-真實 SLAM 地圖會轉成 350–950 個方塊（測試場景只有 12 個）。原本在 Thor 上，每個請求光建 solver 就要 56 s，
-評分每個站位要 4–14 s。改了三件事，選出的站位不變或更好：
-
-1. **只放手臂碰得到的方塊**（`placement.load_envs`、`robot_model.arm_reach`）。以肩關節為中心，任何手臂姿態下
-   碰撞球都在 0.887 m 內（三角不等式，可證明的上界）；更遠的方塊離任何球都超過 cuRobo 的啟動距離 0.01 m，
-   對碰撞成本的貢獻精確為 0。`validation/check_near_exact.py` 用 cuRobo 自己的 FK 驗證：40 萬個隨機手臂姿態
-   最遠 0.770 m；513 個真實擾動站位中，被拿掉的方塊離碰撞球最近 0.169 m。每個站位從 942 個方塊降到中位數 135 個。
-2. **評分改成「LM 種子 ∪ 最佳化結果」**（`placement.solve_envs`）。cuRobo 的 IK 先用 Levenberg-Marquardt 從隨機起點解位姿，
-   再用 MPPI + L-BFGS 處理碰撞。實測第二段會把許多「本來就有效」的 LM 解變成失敗，而且種子越多、在 batch 裡越後面越嚴重：
-   同一個站位複製 4 份放進同一批，得到 18/12/1/0 個成功（滿分 27）。兩者都經過同一套 metrics
-   （碰撞、關節限制、位姿誤差）檢查，所以任一邊有有效解就算到得了；所有 env 都已經有解時就不跑最佳化。
-   改完後，分數和每次呼叫放幾個站位無關，重複執行的跳動也幾乎消失。
-3. **常駐模式**（`run_demo.py --serve`、`BasePlacementPlanner.set_scene`）：solver 只建一次，容量固定
-   （`profile.max_scene_boxes` / `max_near_boxes`），每個請求只把方塊寫進 tensor。容量固定之後，手臂規劃也打開了
-   CUDA graph（Thor 上 1.0–1.4 s → 0.24–0.35 s，選到的站位相同）。
-4. **安全錐外的擾動不觸發最佳化**：它們不管 IK 結果如何都算失敗，所以 LM 種子沒解出來時，也不會因為它們去跑最佳化。
-
-種子數（`validation/bench_seeds.py`，基準是 32 種子、一次一個站位）：在 ec129 與 auto_20260826 上，16／8／4 種子選出的站位都和基準相同，
-regret 都是 0，pass 判定一致率 1.00，所以預設改成 8 個。
-
-| Thor，實驗室真實地圖 | 修改前 | 修改後 |
+| What | Key | Current value |
 |---|---|---|
-| 建 solver | 每個請求 56 s | 常駐只在啟動時一次，11.9 s |
-| 評分（每個站位） | 8.7–13.6 s（16 種子） | 0.36–0.58 s（8 種子） |
-| 手臂軌跡規劃 | — | 0.24–0.35 s |
-| 一個請求（常駐，auto_20260826 / ec129，12 次） | 數分鐘 | 2.6–17.4 s，通常 3–6 s；成功 12/12 |
+| arm mount on Kachaka | `robot.arm_mount_xyz`, `arm_mount_rpy_deg` | (0.08, 0, 0.525) m, lab URDF |
+| gripper frame of the requested pose | `robot.tool_frame`, `tool_offset_m` | `pinch_center`, 0.12 m in front of `gripper_base` |
+| Kachaka body | `robot.kachaka.size_m`, `extra_spheres` | 0.387 × 0.240 × 0.095 m; camera pole not yet added |
+| arm pose while driving / start of `plan_arm` | `robot.stow_arm` | mm_actions' carry pose |
+| safety cone | `robot.bearing_limit_rad` | ±30° |
+| navigation error | `robustness.perturb_xy_m`, `perturb_yaw_deg` | ±5 cm, ±5° (**assumed — measure Kachaka**) |
+| acceptance | `robustness.threshold`, `min_accept` | 1.0, 0.5 |
+| search window | `search.window_x`, `window_y` | ±1.5 m around the current pose |
+| point cloud → obstacles | `map.*` | 4 cm voxels for boxes; ESDF ±0.25 m, 1 cm |
+| compute budget | `profile.*` | 128 whole-body seeds, 8 scoring seeds |
 
-常駐模式下，剩下的時間主要是評分（每個站位約 0.5 s；最壞的情況要評 27 個站位），以及從點雲建場景
-（CPU 約 1.2 s；第一次讀地圖約 5–6 s）。
+Options measured but off by default: `robustness.perturb_points: 9` (centre + 8 corners instead of 27) and
+`profile.bound_scoring` (§9.5); `map.crop_to_window` (§9.3).
+
+---
+
+## 8. The teammate's aligned wrist scene (Grasp Lab Global)
+
+The coarse SLAM map is blurry near small objects, and it was scanned on a different day than the grasp. A teammate's
+**Grasp Lab Global** (in `mm_system_prod`) aligns the wrist camera's view to the SLAM map and saves `map_from_arm`
+(Piper base → map) with every capture. **The alignment is the teammate's work; this project only reads it.**
+[`grasp_lab.py`](grasp_lab.py) turns a saved capture into our input without changing any of their code:
 
 ```bash
-python validation/bench_near.py <地圖根目錄> <site>                  # 全部方塊 vs 只放附近：分數差、時間（各重複 3 次）
-python validation/check_near_exact.py <地圖根目錄> <site> <bench_near 的輸出>   # 被拿掉的方塊確實碰不到
-python validation/bench_seeds.py <地圖根目錄> <site> <bench_near 的輸出>        # 種子數／warm start 對 32 種子基準
-```
-
-### Profiling：時間花在哪（`validation/profile_plan.py`）
-
-Thor 上跑了三張地圖（auto_20260826、ec129、map803），共 60 個請求，其中 15 個找到站位。數字是這 15 個請求的中位數：
-建場景 1.22 s、整體 IK 0.04 s、**評分 3.17 s**、手臂規劃 0.28 s，合計約 4.7 s。
-
-- 評分時間的 99% 是 IK 第二段的最佳化（MPPI + L-BFGS），每次呼叫 1.87 s；LM 解加上檢查只要 0.01 s。
-- 43 次評分呼叫全部觸發最佳化。觸發時，LM 沒解出來的擾動中位數是 38/101。
-- 最佳化在 LM 沒解出來的 2120 個擾動中只救回 62 個（2.9%）。159 個站位裡只有 1 個靠它才達到 27/27，
-  18 個請求裡只有 1 個因此選到不同的站位。
-
-所以最佳化不能整個拿掉（會改變結果），但可以只在可能改變答案的地方跑：只對 LM 沒解出來的擾動跑；
-或先用 LM 評完所有站位，只對比「第一個 LM 就 27/27 的站位」更近的站位跑最佳化。
-
-### 最佳化只用在可能改變答案的地方（`profile.lazy_optimiser`，預設開啟）
-
-依照上面的 profiling，評分改成兩步（`placement._lm_pass`、`placement._finish`），選站規則不變（由近到遠，第一個 27/27）：
-
-1. **先用 LM 評完所有候選站位**：只跑 IK 第一段加上檢查，每次呼叫約 0.01 s。
-2. **需要某個站位的最終分數時**，只把它 LM 沒解出來、而且在安全錐內的擾動，連同後面站位的，裝滿另一個小批次的求解器
-   （`profile.optimiser_batch`，27 格）去跑最佳化。LM 已經 27/27 的站位不需要最佳化；比選中站位更遠的站位也不會被算。
-
-`validation/bench_lazy.py`，Thor，三張地圖，60 個請求：
-
-| 設定 | 和舊做法選到相同結果 | 評分時間總和 | 評分中位數 | 規劃中位數（找到站位的請求） |
-|---|---|---|---|---|
-| 舊做法 | — | 81.5 s | 3.21 s | 3.60 s |
-| 舊做法再跑一次 | 55/60（舊做法本身的變化） | 92.4 s | 4.41 s | 5.34 s |
-| **新做法，批次 27（預設）** | **59/60** | **38.1 s** | **1.30 s** | **1.61 s** |
-| 新做法，批次 54 | 55/60 | 29.7 s | 1.18 s | 1.52 s |
-
-找到站位的請求兩邊都是 15 個。新做法和舊做法的差異比舊做法自己重跑的差異還小；最慢的請求從 13.4 s 降到 6.6 s。
-最佳化的結果會受到「哪些問題放在同一批」影響；把不同站位的擾動放進原本的大批次時，60 個請求裡有 4 個結果不同，
-所以最佳化改用自己的小批次。
-
-### 建場景用多核心（`map.box_workers`，預設 8）
-
-點雲切方塊時，每個物體各自獨立計算（`scene_io._object_boxes`），所以改成分給多個 CPU 行程同時算。
-行程池在第一次用到時建立，之後一直沿用；結果依原本的順序組回，每個方塊的名稱、位置、大小、角度都和不平行時**完全相同**
-（6 個真實請求逐一比對，2／4／8 個 worker 都相同）。
-
-Thor，三張地圖，60 個請求（`validation/profile_plan.py`，最佳化只用在可能改變答案的地方 + 8 個 worker）：
-
-| | 之前 | 現在 |
-|---|---|---|
-| 整個請求（找到站位的 15 個，中位數） | 4.74 s | **1.95 s** |
-| 最慢的請求 | 14.8 s | 5.7 s |
-| 建場景 | 1.22 s | 0.26 s |
-| 評分 | 3.17 s | 1.28 s |
-| 手臂規劃 | 0.28 s | 0.28 s |
-
-之後手臂軌跡規劃移出 `plan()`（見 2.4），同樣 60 個請求：找到站位的 15 個中位數 **1.66 s**，10/15 在 2 s 內，最慢 5.8 s。
-
-### 只把手臂碰得到的地圖切成方塊？（`map.crop_to_window`，預設關閉）
-
-試過在切方塊之前，就丟掉「搜尋視窗內任何站位的手臂都碰不到」的點（`scene_io.window_reach_mask`），
-同時把搜尋視窗縮小，對應「機器人已經在目標旁邊、只小幅移動」的情境。`validation/bench_roi.py`：auto_20260826 + ec129，
-每張地圖 10 個夾爪位姿 × 2 種起點距離，RTX PRO 6000：
-
-| 設定 | 方塊數（中位數） | 建場景 | 有解的請求（起點 0.6–0.9 m / 0.9–1.3 m） | 選到的站位和現在相同 |
-|---|---|---|---|---|
-| 視窗 ±1.5 m，不裁切（現在） | 666–942 | 0.77–0.86 s | 6 / 6 | 重跑 12/12 相同 |
-| ±1.5 m + 裁切 | 650–939 | 0.77–0.89 s | 6 / 6 | 10/12 |
-| ±0.8 m + 裁切 | 494–786 | 0.62–0.83 s | 6（少 1）/ 6 | 1/11 |
-| ±0.5 m + 裁切 | 322–606 | 0.45–0.61 s | 7 / 1（少 5） | 1/7 |
-
-- 現在的 `roi_radius_m` 1.8 m 本來就差不多等於「手臂碰得到的範圍」，所以視窗不變時方塊幾乎沒少，速度也沒變。
-- 視窗縮到 ±0.5 m，建場景只省約 0.3 s；起點稍遠時就找不到站位，選到的站位穩健度也較低。
-- 就算視窗不變，物體在裁切邊界被切斷後，方塊會重新擬合，結果會跟著變；不裁切時重跑結果完全相同。
-
-Thor 上（auto_20260826、ec129、map803，共 240 個請求）結論相同，而且更明顯：建場景從 1.22 s 最多只降到 0.73–0.89 s，
-但整個請求的中位數從 4.6–4.7 s 變成 4.9–20.3 s。視窗變小之後好的候選站位變少，要評分的站位反而變多。
-
-結論：速度收益小，又會改變結果，所以預設關閉。
-
-## 10. 修改前的基準（commit `11d341b`，2026-10-14）
-
-第 9 節的修改**之前**的量測，留作對照：結論已被第 9 節取代。在 Jetson Thor（lab173，實驗室 `mm-gpu` image 內的
-cuRobo 0.8.0.post1）上量，測試程式在 `validation/`。
-
-### 10.1 測試場景，20 個夾爪位姿（`bench_multi_grasp.py`）
-
-同一個罐子，接近方向每 36° 一個、水平與往下 30° 兩種，共 20 個；只有 4 個有可停的站位。
-
-| 做法 | 20 個總時間 | 選中 |
-|---|---|---|
-| 每個夾爪位姿各跑一次 `plan()`（含手臂規劃），再挑最好的 | 14.3 s | #13，穩健度 0.96 |
-| 全部評分完再挑，只對選中的做手臂規劃 | 6.3 s | 同上 |
-| ＋第一輪 IK 就 0 解的夾爪位姿直接放棄（不重試 4 輪） | 3.6 s | 同上 |
-
-- 時間主要花在穩健度評分；whole-body IK（128 種子）每個夾爪位姿只要約 7 ms。whole-body 種子降到 32 會漏掉好站位，不要降。
-- Thor 的 GPU 已經算滿：每批放更多站位（4 → 32）反而更慢、更吃記憶體，所以把多個夾爪位姿合併成同一批沒有好處。
-- 同一個測試場景，Thor 比 RTX PRO 6000 慢約 4.5 倍（每個站位 136 ms vs 30 ms）。
-
-### 10.2 真實地圖：評分種子能不能減少（`bench_lab_maps.py`）
-
-實驗室 5 張地圖、每張 2 個桌上物體、每個物體 20 種抓法。同一批候選站位分別用 16（現在的設定）、8、4 個評分種子評分，
-以 32 種子為基準。品質損失 = 基準的最佳分數 − 基準替該設定選中的站位打的分數。
-
-12 個場景中 6 個有效；另外 6 個（ec129_0911_bridge、ec129_manual_0813b、new_P_1908）20 種抓法都沒有候選站位，
-這三張地圖沒有 `instance_labels.npz`，地板與物體位置是估的，應是測資準備的問題，不列入比較。
-
-| 評分種子 | 6 個場景總評分時間 | 選錯站位的場景 | 最大品質損失 | 平均誤差 | 可接受判斷一致率（最差／平均） |
-|---|---|---|---|---|---|
-| **16（現在）** | 970 s | 0 | 0 | 0.018 | 86% ／ 96% |
-| 8 | 482 s | 1 | 0.30 | 0.025 | 79% ／ 94% |
-| 4 | 130 s | 1 | 0.22 | 0.041 | 78% ／ 90% |
-
-- 簡單場景（很多站位穩健度 1.0）種子多少都選對；擁擠的場景（ec129_0813b 瓶子 21，最好的站位 0.889）8 種子把最好的站位低估，
-  改選一個只有 0.593 的，分數系統性偏低。原因後來查到是 cuRobo 的最佳化步驟把有效的 LM 解變成失敗；
-  第 9 節改成「LM 種子 ∪ 最佳化結果」之後，8 種子與 32 種子選出相同站位，所以預設改為 8。
-- 真實地圖的障礙方塊遠比測試場景多（28–945 個 vs 12 個），評分時間大約和方塊數成正比：945 個方塊時 16 種子每個站位約 13 s。
-
-### 10.3 手臂碰不到的方塊（`reach_cull.py`，只用 CPU）
-
-以夾爪為中心的保守上界（手臂 1.07 m、底盤水平 1.12 m 且低於 0.105 m）只做計數：12 個場景平均可拿掉 61%（3899 → 1536 個）。
-第 9 節以肩關節為中心的做法（0.887 m，每個站位各自篩）更緊，也已用 cuRobo 的 FK 驗證，實際採用的是那個。
-
-## 11. 學長對齊好的手腕場景（Grasp Lab Global）
-
-`grasp_lab.py` 讀 `mm_system_prod` 的 Grasp Lab Global 存下來的錄製資料（`main_ws/grasp_logs/<run>/`），**只讀、不改他們的程式**，
-轉成這裡的輸入：一個 `.npz`（格式同第 1 節）加上一行一個請求的 `.jsonl`（直接餵給 `run_demo.py --serve`）。
-
-```bash
-python grasp_lab.py --lab-map <map803_0930> --run <grasp_logs/run> [--run ...] --out <dir> [--top 32] [--drop-stale]
+python grasp_lab.py --lab-map <map dir> --run <grasp_logs/run> [--run ...] --out <dir> [--top 32] [--drop-stale]
 python run_demo.py --serve < <dir>/<run>_requests.jsonl
 ```
 
-- **座標**：`global_pose.json` 的 `map_from_arm` 是 Piper base → 他們的 metric map。他們的 xy 和 `lab_map.py` 完全相同（同一份
-  `alignment_*.yaml`），z 沒有扣地板，所以減掉 `floor_height_m`（`lab_map.load_lab_map` 現在會回傳）。
-- **夾爪位姿**：GraspGen 的抓取框架 = `gripper_base` 繞 z 轉 −90°（實機執行的終點 FK 與 `chosen_grasp` 完全吻合）；
-  `pinch_center = grasp · Rz(90°) · (0, 0, tool_offset_m)`。
-- **合併**：相機看得到的地方以相機為準。SLAM 點投影到手腕深度圖上，如果比量到的表面還近 5 cm 以上（相機看穿了它），就刪掉；
-  再加入深度圖點雲（1 cm 體素）。目標 = 分割遮罩內、離 Grasp Lab 清理過的物體點雲（`clouds.npz` 的 `object_pts`）1.5 cm 內的像素，
-  以及緊貼它的 SLAM 點；遮罩內其他像素是深度邊緣的混合像素，不加入。
-- **`--drop-stale`（只用在這次的測試資料）**：map803 是 9/30 掃的，桌上有好幾個瓶子；錄製是 10/08，只剩一個。SLAM 裡和目標同類別、
-  ≥30% 落在相機畫面內的物體整個刪掉。和抓取同時掃的地圖不需要這個選項。
-- **檢查（只回報，不修正）**：手腕點到 SLAM 的距離、手臂基座高度與傾斜。
+- **Frames**: their map x, y equal ours (same `alignment_*.yaml`); their z keeps the raw plane-normal height, so
+  `floor_height_m` (returned by `load_lab_map`) is subtracted.
+- **Gripper pose**: a GraspGen grasp frame is `gripper_base` turned −90° about z (checked with FK of the arm's executed
+  final pose), so `pinch_center = grasp · Rz(90°) · (0, 0, 0.12 m)`.
+- **Merging — a stop-gap until the teammate delivers merged maps**: SLAM points the wrist camera saw through (more than
+  5 cm in front of the measured depth) are dropped, and the depth image is added as 1 cm voxels. The target is the
+  segmented pixels within 1.5 cm of Grasp Lab's cleaned object cloud; other masked pixels are depth-edge mixed pixels
+  and are left out.
+- **`--drop-stale` (this test data only)**: map803 was scanned on 9/30 with several bottles on the table; the captures
+  are from 10/08 with one. SLAM objects of the target's class mostly inside the camera image are dropped. The videos
+  above use this cleaned map. A map scanned together with the capture does not need it.
+- **Checks reported, nothing corrected**: wrist points lie a median 1.2 cm from the SLAM points and the bottle stands on
+  the SLAM table, so the alignment is good. The arm base implied by `map_from_arm` is 0.42 / 0.47 m high (mounted at
+  0.525 m) and tilted 9° in one capture, so the robot's start pose derived from it is only approximate (the
+  API → Piper mount is not calibrated yet).
 
-map803_0930，兩筆 bottle 錄製（`20261008_045944`、`050210`），實機執行的抓取 + GraspGen 候選，共 57 個請求，`--drop-stale`：
+![top views](docs/media/fused_topdown_esdf.png)
 
-- 對齊：手腕點到 SLAM 點中位距離 1.2 cm，瓶底落在 SLAM 桌面上；推回的手臂基座高 0.42／0.47 m（安裝高度 0.525 m），
-  第二筆傾斜 9.3°，所以起點位姿只是近似。
-- **只用方塊時，Thor 上 57 個請求全部無解（`no_ik_solution`），每個 1.61 s**（中位數；建場景 0.16 s、整體 IK 1.44 s、約 325 個方塊）。
-  ESDF（第 12 節）之後：28 個有站位。
-- 原因是碰撞模型的精度，不是地圖：拿掉障礙物求出的手臂姿態裡，14 個代表性抓取有 8 個在真實點雲上有 0.2–2.8 cm 的間隙
-  （實機那個是 +1.3 cm），但方塊判定陷入 4–7 cm。瓶子左右的紙箱底板和後牆被 4 cm 格子的高度圖包成兩個實心方塊，佔掉手指的空間。
-- 試過在目標附近改用 1–2 cm 的細高度圖：精度夠時方塊數 800–6000 個，Thor 上無法接受，沒有保留。改用 ESDF，見第 12 節。
-- 更正：先前版本把遮罩邊緣的混合像素和 SLAM 的舊瓶子都算成目標，目標被放大成 15×18 cm，切方塊時避開目標的範圍也跟著變大，
-  剛好挖掉了上面那兩個方塊，得到「10/57 有站位、實機抓取 27/27」。那是錯的；目標修正為 6×6×21 cm 後是上面的結果。
+*Thor `plan()` output on the cleaned test map: both executed grasps need only 2–7 cm of driving; GraspGen's other
+candidates about 0.5 m.*
 
-## 12. 目標附近用 ESDF（`map.esdf_half_m`，預設 0.25 m）
+---
 
-方塊是 4 cm 格子的 2.5D 高度圖，平面加牆（紙箱底板＋後牆、桌面＋擋板）會被包成實心塊。目標附近 50×50×70 cm 的範圍裡，
-方塊佔掉的空地（離任何點 > 3 cm）：auto_20260826 7–8%、ec129_0813b 8%、map803_0930 26–27%、整合地圖 26–33%（`validation/overcover.py`）。
-手指離旁邊的東西只有 1–3 cm，這些多包的體積剛好擋住抓取。
+## 9. Validation and measurements
 
-做法（`scene_io.esdf_grid`、`placement.write_grid`）：
-- 夾爪位置周圍 ±0.25 m × ±0.25 m × ±0.35 m（z ≥ 0.15 m；更低的仍用方塊，停車檢查用得到）的點不切方塊，改成 1 cm 的有號距離場
-  （cuRobo v2 `VoxelData`，float16，內部為負）。區域外照舊是方塊，兩者同時在同一個碰撞核心裡算。
-- 每個 1 cm 直欄從最低點填到最高點，上下兩點相距超過 5 cm 就斷開：看得到頂面的東西是實心的，但箱底和後牆之間、桌面上方的空間保留。
-- 目標佔地範圍（外擴 `target_grow_m`）內、高於目標底部的不填，和方塊的 `keep_out` 相同：SLAM 會把支撐物模糊到物體裡。
-- 距離再扣 `esdf_margin_m`（0.5 cm，各方向）；體素化本身平均已經往外 0.5 cm，合計和方塊的外擴（水平 1 cm、垂直 0.5 cm）相當。
-- 每個 multi-env 環境寫入同一份距離場（每個請求複製一次）、各自的位姿（和方塊同一個閉式解）；`plan_arm` 在 `update_world` 之後寫入。
+### 9.1 Scenario tests (`validation/run_scenarios.py`)
 
-驗證：
-- `validation/run_scenarios.py`：9/9 PASS（baseline 穩健度和方塊版同為 0.67）。
-- 3 張實驗室地圖、60 個請求（`profile_plan.py`，Thor）：有站位 15 → **20**；有站位的請求中位數 1.60 → **1.48 s**（最慢 5.8 → 9.0 s，走退路的請求）。
-  方塊版多解出的 3 個：在方塊版選的站位規劃手臂，軌跡會壓進離瓶子 1.6–2.7 cm 的點 0.5–0.8 cm。
-- 整合地圖 57 個請求（Thor）：有站位 0 → **28**，27/27 的 16 個中位數 **0.97 s**（最多 1.96 s），建場景 0.19 s；28 個中 25 個和工作站選同一站位。
-  每個站位都用 `plan_arm()` 規劃手臂，再用 URDF FK 的碰撞球量整條軌跡到**原始點雲**的距離：28/28 規劃成功、夾爪終點誤差 0 mm；
-  離瓶子 1 cm 以外的點，27/28 全程有正間隙，剩下 1 個壓進離瓶子 1.7 cm 的點 1.6 mm（在 3 cm 的目標寬限內）。
-- 還沒解決：走退路（沒有 27/27 的站位）的請求 7–11 s，因為要評完所有候選。
+One condition of the synthetic test scene (`test_maps/`: a can on a table behind a board, a cabinet on the left, walls
+behind and to the right) is changed per scenario, to check every `reason` appears where it should. 9/9 pass, with and
+without the ESDF:
 
-## 13. 評分加速：上下界跳過（A）與 9 點擾動（C）（`validation/bench_bound.py`，兩者預設關閉）
-
-- **A，`profile.bound_scoring`**：第一段 LM 之後，每個站位的分數範圍已知：至少 = 已解出的數量，至多 = 已解出 + 安全錐內未解的數量（不受隨機影響）。
-  上界到不了門檻的站位不跑第二段最佳化；沒有站位通過時依上界由高到低評，上界贏不過目前最好的分數（同分看距離）就停止。
-  選站規則不變。
-- **C，`robustness.perturb_points: 9`**：中心＋8 個角落（±xy、±yaw 同時取極端），取代 27 個組合。
-
-Thor，同樣的請求，每個設定一個常駐 planner（中位數）：
-
-| | 3 張實驗室地圖 60 個：27/27／退路（最慢）／評分總時間 | 整合地圖 57 個：27/27／退路（最慢）／評分總時間 |
+| Scenario | Change | reason |
 |---|---|---|
-| 27 點（現在） | 1.13 s／2.92 s（8.6）／57 s | 0.73 s／7.09 s（10.6）／110 s |
-| 27＋A | 0.78 s／2.83 s（4.6）／45 s | 0.53 s／4.79 s（7.9）／82 s |
-| 9 點 | 0.47 s／1.71 s（3.0）／25 s | 0.49 s／2.75 s（4.1）／44 s |
-| 9＋A | 0.47 s／1.53 s（2.0）／21 s | 0.49 s／2.38 s（3.2）／38 s |
+| `baseline` | none | `ok` (fallback, 0.67) |
+| `loose_threshold` | `threshold` 0.5 | `ok` (0.63) |
+| `unreachable` | gripper 2 m above the floor | `no_ik_solution` |
+| `gripper_in_cabinet` | gripper inside the cabinet | `no_ik_solution` |
+| `cone_closed` | safety cone ±0° | `outside_cone` |
+| `no_drivable_area` | nothing drivable within 1.2 m | `cannot_park` |
+| `sloppy_navigation` | navigation error ±15 cm, ±15° | `not_robust` |
+| `arm_plan` | `plan_arm()` at the chosen station | `ok` |
+| `bad_stow` | stowed arm all zeros (self-colliding) | `arm_plan_failed` |
 
-- 9 點之後，A 只再省 13–14% 的評分時間，主要是壓低最慢的退路請求。
-- 9 點判定通過的 46 個站位，用 27 點重評：45 個是 27/27，1 個 22/27。退路比較弱：9 點分數只有 9 級，整合地圖上 3–5 個退路站位用 27 點重評低於 14/27（現在的規則會拒絕）。
-- 隨機性的尺度：同一設定重跑結果完全相同（cuRobo 內部亂數只隨呼叫順序推進，換 torch 種子也不變）；但只把請求順序倒過來，
-  27 點版自己就有 26/27 選到不同站位、3 個有解↔無解互換。A 造成的差異（1–3 個請求、分數差 1 分）遠在這個範圍內。
-- 下一步候選：「9 點找、27 點確認」——9 點全過時補算其餘 18 點；退路用 9 點排序、前幾名用 27 點重評。品質與現在相同，速度接近 9 點。
+### 9.2 Making it fast on the Thor
+
+With real SLAM maps (350–950 boxes instead of 12), a request first took minutes on the Thor: 56 s to build the solvers
+and 4–14 s to score each station. In order:
+
+| Change | Effect (Thor, real maps) |
+|---|---|
+| Only the boxes the arm can reach from a station (provable bound; `validation/check_near_exact.py`: 400k random arm poses never exceed 0.770 m < 0.887 m) | 942 → 135 boxes per station, ~5× faster scoring, identical scores |
+| Score = LM seeds ∪ optimiser results (the optimiser was turning valid LM solutions into failures) | scores no longer depend on batch position; 8 seeds pick the same stations as 32 |
+| Long-running solvers (`--serve`, `set_scene`) | 56 s per request → once at startup |
+| Optimiser only where it can change the answer (`profile.lazy_optimiser`) | scoring 3.2 → 1.3 s, same answer 59/60 |
+| Box fitting in parallel (`map.box_workers`) | scene 1.22 → 0.26 s, identical boxes |
+| Arm trajectory moved out of `plan()` | request median 1.95 → 1.66 s |
+| ESDF near the target (§9.4) | 15 → 20 stations found on 60 requests, 1.60 → 1.48 s |
+| Processed-map cache, vectorised wrist merge | map 3.8 s → 7 ms after the first time; merge 0.59 → 0.11 s (identical points) |
+
+Profiling (`validation/profile_plan.py`) showed 99% of scoring time in the optimiser, which rescued only 2.9% of the
+perturbations LM missed — hence the lazy optimiser rather than removing it.
+
+### 9.3 Tried and kept off
+
+- **Cropping the map to the arm's reach** (`map.crop_to_window`): the 1.8 m ROI is already about the arm's reach;
+  smaller search windows saved ~0.3 s of scene building but found fewer stations and made requests slower overall.
+- **A finer box grid near the target** (1–2 cm cells): accurate enough, but 800–6000 boxes instead of ~350 — too slow
+  on the Thor. Replaced by the ESDF.
+
+### 9.4 ESDF near the target
+
+Measured with `validation/overcover.py` (volume within 50 × 50 × 70 cm of the target that is farther than 3 cm from any
+point, yet inside an obstacle):
+
+![over-coverage](docs/media/esdf_overcover.png)
+
+Thor, same requests with and without the ESDF:
+
+| | Boxes only | Boxes + ESDF |
+|---|---|---|
+| 3 lab maps (auto_20260826, ec129_0813b, map803_0930), 60 requests: stations found | 15 | **20** |
+| … median request with a station | 1.60 s | **1.48 s** |
+| fused test map, 57 grasps: stations found | 0 | **28** |
+| … median request with a 27/27 station | — | **0.97 s** |
+
+- The 3 requests only the boxes solved: their arm path at the box version's station presses 5–8 mm into points 1.6–2.7 cm
+  from the bottle, so the finer model rejects grasps that were really scraping.
+- Every one of the 28 fused-map stations was checked independently: `plan_arm()` from the station, then URDF FK spheres
+  measured against the **raw points** (not the grid). 28/28 planned, gripper error 0 mm; ignoring points within 1 cm of
+  the bottle, 27/28 stay clear the whole way, one touches a point 1.7 cm from the bottle by 1.6 mm (inside the 3 cm
+  target allowance).
+- Most GraspGen grasps on this capture remain impossible: 8 of 14 representative ones have only 0.2–2.8 cm of real
+  clearance, others none.
+
+### 9.5 Robustness check: 9 points vs 27, and bounds (`validation/bench_bound.py`)
+
+| Thor, median | 3 lab maps: 27/27 · fallback (slowest) · total scoring | fused map: 27/27 · fallback (slowest) · total scoring |
+|---|---|---|
+| 27 points (default) | 1.13 s · 2.92 s (8.6) · 57 s | 0.73 s · 7.09 s (10.6) · 110 s |
+| 27 + bounds | 0.78 s · 2.83 s (4.6) · 45 s | 0.53 s · 4.79 s (7.9) · 82 s |
+| 9 points | 0.47 s · 1.71 s (3.0) · 25 s | 0.49 s · 2.75 s (4.1) · 44 s |
+| 9 + bounds | 0.47 s · 1.53 s (2.0) · 21 s | 0.49 s · 2.38 s (3.2) · 38 s |
+
+- **Bounds** (`profile.bound_scoring`): after LM a station's score lies between what LM solved and that plus the
+  unsolved perturbations; stations whose upper bound cannot win skip the optimiser. Same selection rule.
+- **9 points** (`robustness.perturb_points: 9`): 45 of 46 stations that passed 9 points also pass all 27; the fallback
+  ranking is coarser (3–5 weak picks on the fused map).
+- Run-to-run variation is the yardstick: the same settings repeat exactly, but merely reversing the request order makes
+  the default pick a different station in 26 of 27 cases (cuRobo's internal random state follows the call sequence).
+- Next: "9 points to search, 27 to confirm" should keep today's quality at nearly the 9-point speed.
+
+---
+
+## 10. Files
+
+```
+curobo-base-placement/
+├─ config.yaml           every assumption and parameter
+├─ placement.py          BasePlacementPlanner: solvers, set_scene(), plan(), plan_arm()
+├─ scene_io.py           point cloud + request → PlanningScene (target, drivable area, boxes, ESDF grid)
+├─ robot_model.py        the 9-DoF cuRobo model (Kachaka x, y, yaw + Piper), safety cone, reach bound
+├─ lab_map.py            the lab's exported map folder → map-frame points (cached in .map_cache/)
+├─ grasp_lab.py          Grasp Lab Global captures → merged points + requests (§8)
+├─ run_demo.py           command line: one request, --serve, --arm
+├─ demo_multi_grasp.py   the whole flow with N grasps (§1)
+├─ bundle.py             pack everything into one script for a GPU server
+├─ make_test_maps.py, test_scene.yaml, test_maps/   the synthetic test scene
+├─ validation/           tests and benchmarks; the main code never imports them (validation/README.md)
+├─ assets/               robot129.yml (cuRobo config, collision spheres), URDF and meshes
+└─ docs/media/           the videos and figures in this README
+```
+
+---
+
+## 11. Known limitations and open items
+
+- **Navigation error ±5 cm / ±5° is assumed**; measure Kachaka's real error, which changes how often a perfect
+  station exists.
+- **Fallback requests are slow** (5–11 s on the Thor) because every candidate is scored; "9 points to search, 27 to
+  confirm" (§9.5) is the next step.
+- **Grasp orientation is fixed by upstream.** An obstacle right in front of the bottle blocks every grasp from that
+  side (the board video works only because a side grasp exists); upstream then has to supply another grasp.
+- **Maps**: the SLAM map and the wrist capture of the test data are from different days (`--drop-stale`); merging should
+  move to the teammate's complete version. The API → Piper mount must be calibrated (implied arm base 0.42 vs 0.525 m).
+- `no_ik_solution` is not a proof; a colliding gripper pose is reported the same way.
+- Only the Kachaka body is modelled for the base; the column holding the arm above it is not, and the camera pole on
+  the right side is missing from `robot.kachaka.extra_spheres`.
+- Space under tables etc. is solid in the box model (the ESDF keeps gaps over 5 cm only near the target).
+- cuRobo v2's `collision_checking.validate()` has a bug in this version; parking is checked with numpy instead.

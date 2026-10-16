@@ -3,3 +3,4 @@
 numpy
 scipy
 PyYAML
+Pillow    # grasp_lab.py: wrist depth images and masks
