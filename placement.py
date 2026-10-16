@@ -482,6 +482,12 @@ class BasePlacementPlanner:
             n_cone, U, park = self._timed("filter_s", self._candidates, Q)
             if park.sum() >= P["min_candidates"]:
                 break
+        if P.get("try_current_pose", True) and len(Q):
+            # where Kachaka stands now is a candidate too (the whole-body IK rarely lands exactly on it): nearest of all,
+            # so if it survives the navigation errors the answer is "don't move"
+            here = np.zeros((1, 9))
+            if in_safety_cone(self.cfg, here[:, :3], self.gpos[:2])[0] and not np.any(np.all(np.abs(U[:, :3]) < 1e-6, axis=1)):
+                U = np.vstack([here, U]); park = np.r_[self._timed("filter_s", self.parking_ok, here[:, :3]), park]
         dist = np.hypot(U[:, 0], U[:, 1]) if len(U) else np.zeros(0)
         order = [int(j) for j in np.argsort(dist) if park[j]]
         # 3.+4. nearest first: robustness, then plan the first one that passes
