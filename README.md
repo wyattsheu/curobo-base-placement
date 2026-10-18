@@ -140,12 +140,13 @@ docker run -d --name base_placement --restart unless-stopped --runtime nvidia --
   --entrypoint bash mm-gpu:latest -c "python3 run_demo.py --lab-map /maps/map803_0930 --serve"
 ```
 
-Details, notes and the service protocol: [docs/deployment.md](docs/deployment.md).
+Details, notes and the service protocol: [docs/deployment.md](docs/deployment.md). Plugging it into mm_system (image, callers, file formats): [docs/integration.md](docs/integration.md).
 
 ## Documentation
 
 | | |
 |---|---|
+| [docs/integration.md](docs/integration.md) | **for the mm_system team:** which docker image, how other processes call it, exact input / output formats, open points to agree on |
 | [docs/usage.md](docs/usage.md) | the full API, many grasps, input and output formats, `config.yaml` |
 | [docs/deployment.md](docs/deployment.md) | running it on the Thor as a service, what each step costs |
 | [docs/how_it_works.md](docs/how_it_works.md) | point cloud → obstacles (boxes + ESDF), whole-body IK, robustness scoring, frames, files |

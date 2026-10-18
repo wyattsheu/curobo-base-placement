@@ -22,10 +22,11 @@ first time (~3.8 s) happen once at startup; each request then only writes its ob
 
 ## On the Jetson Thor
 
-Use the lab's `mm-gpu:latest` image (cuRobo is already installed). Mount warp's kernel cache, or every start
-recompiles the kernels:
+Use the lab's `mm-gpu:latest` image (cuRobo is already installed; versions checked and a one-minute image check in
+[integration.md](integration.md#1-where-it-runs)). Mount warp's kernel cache, or every start recompiles the kernels:
 
 ```bash
+git clone https://github.com/wyattsheu/curobo-base-placement.git ~/curobo-base-placement
 cd ~/curobo-base-placement
 docker run -d --name base_placement --restart unless-stopped --runtime nvidia --gpus all \
   -v $PWD:/work -w /work \
