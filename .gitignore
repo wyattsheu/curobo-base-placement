@@ -3,3 +3,4 @@ __pycache__/
 *.log
 out/
 .map_cache/
+.warp_cache/

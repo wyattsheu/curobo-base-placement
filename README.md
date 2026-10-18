@@ -31,13 +31,20 @@ Grey = SLAM points, blue = wrist camera, red = the bottle, green rectangle = the
 
 ### 1. Start it with the container
 
+Clone it on the Thor next to `mm_system_prod`. It is mounted into the container, so updating is a `git pull` plus a
+container restart, with no image rebuild:
+
+```bash
+git clone https://github.com/wyattsheu/curobo-base-placement.git /home/acm/curobo-base-placement
+```
+
 It runs in the lab's `mm-gpu` image (the one `mm_actions_node` uses); nothing to install. Add to the container's
 `docker run` (e.g. `mm_system_prod/run.sh`):
 
 ```bash
-  -v ~/curobo-base-placement:/workspace/curobo-base-placement \
+  -v /home/acm/curobo-base-placement:/workspace/curobo-base-placement \
   -v <folder holding the map folders>:/maps:ro \
-  -v ~/curobo-base-placement/.warp_cache:/root/.cache/warp \
+  -v /home/acm/curobo-base-placement/.warp_cache:/root/.cache/warp \
   -e CUROBO_MAP_CACHE=/workspace/curobo-base-placement/.map_cache \
 ```
 
