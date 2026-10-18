@@ -22,8 +22,9 @@ first time (~3.8 s) happen once at startup; each request then only writes its ob
 
 ## On the Jetson Thor
 
-Use the lab's `mm-gpu:latest` image (cuRobo is already installed; versions checked and a one-minute image check in
-[integration.md](integration.md#1-where-it-runs)). Mount warp's kernel cache, or every start recompiles the kernels:
+Use the lab's `mm-gpu:latest` image, the image of `mm_actions_node` (checked 2026-10-18: Python 3.10, cuRobo
+0.8.0.post1.dev43 / commit `78fd485`, torch 2.12.0+cu130 — nothing to install). Mount warp's kernel cache, or every
+start recompiles the kernels:
 
 ```bash
 git clone https://github.com/wyattsheu/curobo-base-placement.git ~/curobo-base-placement

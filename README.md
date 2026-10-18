@@ -32,7 +32,7 @@ Grey = SLAM points, blue = wrist camera, red = the bottle, green rectangle = the
 You need an NVIDIA GPU with PyTorch (CUDA) and **cuRobo v2**, then this project's small requirements.
 
 **On the Jetson Thor:** the lab's `mm-gpu:latest` docker image already has cuRobo; nothing to install. Run everything
-inside it (see [Deploying on the Thor](#deploying-on-the-thor)).
+inside it (see [Loading everything when the system starts](#loading-everything-when-the-system-starts)).
 
 **On an x86_64 machine with an NVIDIA GPU** (tested from scratch on an RTX PRO 6000 with a CUDA 12.8 driver), using
 [uv](https://docs.astral.sh/uv/):
@@ -66,87 +66,90 @@ meshes, collision spheres) is already in `assets/`.
 
 ## Usage
 
+One class, one call. It runs inside the lab's `mm-gpu` image (the image of `mm_actions_node`): nothing to install,
+just put this folder on the Python path.
+
 ```python
-from robot_model import load_config
-from placement import BasePlacementPlanner
-from lab_map import load_lab_map
-import scene_io
+from base_placement import BasePlacement
 
-cfg = load_config("config.yaml")
-planner = BasePlacementPlanner(cfg)                    # once at startup (~14 s on the Thor)
-slam, names, _ = load_lab_map("/maps/map803_0930")     # once per map (~4 s the first time, then cached: ~7 ms)
-occupancy = "/maps/map803_0930/occupancy_map803_0930.yaml"   # Kachaka's 2D map: where the base may park
+bp = BasePlacement("/maps/map803_0930")       # once at startup (~14 s on the Thor): cuRobo + the map
 
-# per grasp
-scene = scene_io.scene_from_slam(slam, base_pose, grasp_pos, grasp_quat_wxyz, cfg,
-                                 target={"instance_id": 13}, occupancy=occupancy)    # ~0.2 s
-planner.set_scene(scene)
-result = planner.plan()                                # ~0.3–1 s
+# whenever a grasp is planned — the inputs are what mm_actions already has
+r = bp.find_standpoint(
+    robot_pose=(x, y, yaw),                   # Kachaka now, map frame (KachakaApiClient.get_robot_pose())
+    grasps=grasp_poses,                       # GraspGenX grasps: 4x4, Piper base frame, best first
+    object_pts=clouds.object_pts,             # optional: the target from the wrist camera, Piper base frame
+    scene_pts=clouds.scene_pts)               # optional: the rest of the wrist view, Piper base frame
 
-if result["ok"]:
-    x, y, yaw = result["chosen_map"]                   # → Kachaka Navigate_to_pose
+if r["ok"]:
+    kachaka.move_to_pose(*r["pose"])          # (x, y, yaw), map frame
+    # after arriving: capture again and grasp as usual
 else:
-    print(result["reason"])                            # why this grasp cannot be done (table below)
+    print(r["reason"])
 ```
 
-- `base_pose` = Kachaka's current (x, y, yaw); `grasp_pos`, `grasp_quat_wxyz` = the gripper pose (`pinch_center`, the
-  point between the fingers; its +z is the approach direction). All in the map frame, metres and radians.
-- `target` tells which points are the object being grasped, so it is not treated as an obstacle: an instance id of the
-  lab map, `{"class": "bottle"}`, or `{"mask_key": ...}` for a boolean mask in the point cloud.
-- **Build the planner and load maps once.** Every request after that only costs its own time.
-- **Arm motion is a separate step.** After Kachaka arrives and the target has been seen again:
-  `planner.set_scene(new scene)`, then `planner.plan_arm()` returns the joint trajectory (~0.3 s).
-- **Several candidate grasps?** [`demo_multi_grasp.py`](demo_multi_grasp.py) solves each one, rejects the impossible
-  ones and picks one; it also shows how to merge a wrist capture into the map.
-- **Command line / service:** `python run_demo.py --lab-map <map> --request request.json` for one request;
-  `--serve` keeps the planner running and answers one JSON request per stdin line.
+It tries the grasps in order and stops at the first one with a base pose that survives every navigation error;
+about **1 s per grasp** on the Thor. Use one `BasePlacement` per process and call it from one thread.
 
-### What happens per request (Thor)
-
-| Step | What | Time |
-|---|---|---|
-| startup, once | build every cuRobo solver and warm up | ~14 s |
-| once per map | process the SLAM map (cached afterwards) | ~3.8 s, then ~7 ms |
-| per wrist capture | merge what the wrist camera saw into the map | ~0.19 s |
-| per grasp: scene | point cloud → obstacles near the grasp (boxes + a 1 cm distance field) | ~0.18 s |
-| per grasp: plan | whole-body IK → candidate base poses → test each against 27 navigation errors | 0.3–0.8 s with a good spot; ~1.5 s if impossible; 5–7 s if only weaker spots exist |
-| after arriving | arm trajectory (`plan_arm()`) | ~0.3 s |
-
-## Result
-
-| Field | Meaning |
+| Result | Meaning |
 |---|---|
 | `ok` | a base pose was found |
-| `chosen_map` | (x, y, yaw) in the map frame → the navigation goal |
+| `pose` | (x, y, yaw) in the map frame → `move_to_pose` |
+| `grasp_index` | which of `grasps` it is for |
 | `robustness` | share of the 27 navigation errors (±5 cm, ±5°) from which the arm still reaches the grasp (1.0 = all) |
-| `below_threshold` | true if no spot survives all 27 and this is the best one (at least half) |
-| `reason` | `ok`, or why not (below) |
+| `fallback` | true if no pose survives all 27 and this is the best one (at least half) |
+| `reason` | `ok`, or why not: `no_ik_solution` (out of reach), `outside_cone` (target outside the arm's ±30° cone), `cannot_park` (no free floor there), `not_robust` (reachable, but not reliably) |
+| `time_s`, `tried` | time, and the outcome of each grasp tried |
 
-| `reason` | Meaning | What upstream can do |
-|---|---|---|
-| `no_ik_solution` | the gripper pose is out of reach or collides from everywhere | another grasp |
-| `outside_cone` | reachable only with the target outside the arm's ±30° safety cone | another grasp |
-| `cannot_park` | the base cannot park anywhere that reaches it | check the map, another grasp |
-| `not_robust` | reachable, but not reliably under navigation error | another grasp |
+**One thing to check on the robot:** the arm mount in `config.yaml` (`robot.arm_mount_xyz`, now (0.08, 0, 0.525) m)
+turns the Piper-frame inputs into the map. `motion/standpoint.py` in mm_actions uses (0.10, 0, 0.50); the measured value
+should be used in both. If Grasp Lab Global has aligned the capture, pass its `map_from_arm=` instead and the mount is
+not used.
 
-## Deploying on the Thor
+### Loading everything when the system starts
 
-Run it as one long-running process inside the lab's image, so the 14 s startup happens once:
+All the slow parts happen inside `BasePlacement(...)`: building the cuRobo solvers, loading the map and starting the
+CPU workers. Create it **once when the arm node starts**, next to the grasp models. After that, every call is about 1 s.
 
-```bash
-docker run -d --name base_placement --restart unless-stopped --runtime nvidia --gpus all \
-  -v $PWD:/work -w /work -v $PWD/.warp_cache:/root/.cache/warp \
-  -v /home/acm/robotic_agent/robotic_system/robot_ws/data/lab:/maps:ro \
-  --entrypoint bash mm-gpu:latest -c "python3 run_demo.py --lab-map /maps/map803_0930 --serve"
+The arm node already runs all GPU work on one worker thread (`GraspStack.run`). Use the same thread for this:
+
+```python
+# when mm_actions_node starts (e.g. right after GraspStack is loaded)
+sys.path.insert(0, "/workspace/curobo-base-placement")
+from base_placement import BasePlacement
+bp = stack.run(BasePlacement, "/maps/map803_0930")               # ~15 s, once
+
+# in an action
+r = stack.run(bp.find_standpoint, robot_pose, grasps, clouds.object_pts, clouds.scene_pts)
 ```
 
-Details, notes and the service protocol: [docs/deployment.md](docs/deployment.md). Plugging it into mm_system (image, callers, file formats): [docs/integration.md](docs/integration.md).
+Add these to the container's `docker run` (e.g. `run.sh`). The two caches must survive restarts:
+
+```bash
+  -v ~/curobo-base-placement:/workspace/curobo-base-placement \
+  -v /home/acm/robotic_agent/robotic_system/robot_ws/data/lab:/maps:ro \
+  -v ~/curobo-base-placement/.warp_cache:/root/.cache/warp \
+  -e CUROBO_MAP_CACHE=/workspace/curobo-base-placement/.map_cache \
+```
+
+| Startup on the Thor (`bp.startup_s`) | Normal | Very first time |
+|---|---|---|
+| cuRobo solvers | ~11 s | ~56 s (GPU kernels are compiled once into the warp cache) |
+| map | ~7 ms | ~3.9 s (processed once into `.map_cache/`) |
+| CPU workers | ~0.2 s | ~0.2 s |
+| imports and the rest | ~3 s | ~3 s |
+| **total** | **~15 s** | ~65 s |
+
+- **Switching maps:** `bp.set_map("/maps/<other map>")`. It takes milliseconds once that map has been seen.
+- **GPU memory:** about 0.5 GB stays in use. One instance per process is enough; requests are answered one at a time.
+
+Lower-level calls (one grasp pose in the map frame, the arm trajectory, other map formats) are in
+[docs/usage.md](docs/usage.md).
 
 ## Documentation
 
 | | |
 |---|---|
-| [docs/integration.md](docs/integration.md) | **for the mm_system team:** which docker image, how other processes call it, exact input / output formats, open points to agree on |
 | [docs/usage.md](docs/usage.md) | the full API, many grasps, input and output formats, `config.yaml` |
 | [docs/deployment.md](docs/deployment.md) | running it on the Thor as a service, what each step costs |
 | [docs/how_it_works.md](docs/how_it_works.md) | point cloud → obstacles (boxes + ESDF), whole-body IK, robustness scoring, frames, files |

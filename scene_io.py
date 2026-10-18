@@ -297,6 +297,16 @@ def _box_pool(workers):
     return _POOLS[workers]
 
 
+def _ping(_):
+    return 0
+
+
+def warm_box_pool(workers):
+    """Start the box-fitting workers now (each imports this module once), so the first request does not wait for them."""
+    if workers > 1:
+        list(_box_pool(workers).map(_ping, range(4 * workers)))
+
+
 def _object_boxes(Po, v, xy_margin, z_margin, fill, level_gap, level_min_cells, max_empty_m2, keep_out):
     """Boxes [(centre, dims, yaw)] of one object's points (objects_to_boxes)."""
     from scipy import ndimage
