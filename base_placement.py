@@ -1,4 +1,5 @@
 """The one entry point for the robot system: where should Kachaka stand to do one of these grasps?
+Called only when mm_actions cannot plan any of the grasps from where the robot stands now.
 
 In Python (inside the mm-gpu image):
 

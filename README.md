@@ -65,21 +65,27 @@ the grasp even if Kachaka stops ±5 cm / ±5° off. Otherwise it returns why not
 
 ### 3. Where it fits in the whole flow
 
+It is **only called when the grasp cannot be done from where the robot stands**.
+
 | Step | What | Who |
 |---|---|---|
 | 1 | Look at the target: wrist capture → `object_pts`, `scene_pts`, GraspGenX grasps | mm_actions (exists) |
-| 2 | Align the wrist view to the map (`map_from_arm`), and keep the map up to date | the alignment program (Grasp Lab Global) |
-| 3 | **Where to stand: `bp.find_standpoint(...)`** | **this repo** |
-| 4 | Drive there: Kachaka `move_to_pose(*r["pose"])` | whoever drives the base (decision_maker / kachaka_nav) |
-| 5 | Arrived: look again (and align again), then plan and execute the arm as today | mm_actions (exists) |
+| 2 | Plan the arm for those grasps from where the robot stands. **If one works, grasp as today; this repo is not called.** | mm_actions (exists) |
+| 3 | No grasp can be planned: align the wrist view to the map (`map_from_arm`) | the alignment program (Grasp Lab Global) |
+| 4 | **A new place to stand: `bp.find_standpoint(...)`** with the same grasps | **this repo** |
+| 5 | Drive there: Kachaka `move_to_pose(*r["pose"])` | whoever drives the base (decision_maker / kachaka_nav) |
+| 6 | Arrived: back to step 1 (look again, new grasps, plan the arm) | mm_actions (exists) |
+
+If `find_standpoint` returns `ok = False`, no place nearby works for these grasps: report the `reason`, or try other
+grasps.
 
 To check when connecting:
 
-- **Step 2.** If the capture is aligned, pass `map_from_arm=` to `find_standpoint`. Otherwise the arm mount in
+- **Step 3.** If the capture is aligned, pass `map_from_arm=` to `find_standpoint`. Otherwise the arm mount in
   `config.yaml` is used, and it has to match the robot: ours is (0.08, 0, 0.525) m, while mm_actions'
   `standpoint.py` uses (0.10, 0, 0.50). When an updated map is available, load it with `bp.set_map(<folder>)`.
-- **Step 4.** Before driving, the 2D map in the folder should be the one Kachaka is using (`map_id`).
-- **Step 5.** This repo only decides where the base goes; the arm is planned by mm_actions after arriving.
+- **Step 5.** Before driving, the 2D map in the folder should be the one Kachaka is using (`map_id`).
+- **Step 6.** This repo only decides where the base goes; the arm is planned by mm_actions after arriving.
 
 ## Installation
 
