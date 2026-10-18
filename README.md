@@ -36,18 +36,26 @@ It runs in the lab's `mm-gpu` image (the one `mm_actions_node` uses); nothing to
 
 ```bash
   -v ~/curobo-base-placement:/workspace/curobo-base-placement \
-  -v /home/acm/robotic_agent/robotic_system/robot_ws/data/lab:/maps:ro \
+  -v <folder holding the map folders>:/maps:ro \
   -v ~/curobo-base-placement/.warp_cache:/root/.cache/warp \
   -e CUROBO_MAP_CACHE=/workspace/curobo-base-placement/.map_cache \
 ```
 
-Then load it once when the node starts, on the same GPU thread as the other models:
+Then load it once when the node starts, on the same GPU thread as the other models. The map is passed in as a
+folder, the lab's exported map of the current environment (example name `map803_0930`):
 
 ```python
 sys.path.insert(0, "/workspace/curobo-base-placement")
 from base_placement import BasePlacement
-bp = stack.run(BasePlacement, "/maps/map803_0930")      # ~15 s (the very first start ~65 s: kernels + map are cached)
+bp = stack.run(BasePlacement, map_dir)                   # e.g. map_dir = "/maps/map803_0930"; ~15 s, once
 ```
+
+A new environment only needs its newly scanned map folder: pass that folder here, or switch while running with
+`stack.run(bp.set_map, new_map_dir)`. Each new map is processed once (a few seconds) and cached.
+
+The map folder is the lab's map export: the 3D semantic map (`*_sem_color_fine.npz`, `*_instance_labels.npz`,
+`*_instance_semantic_table_fine.json`), its alignment to Kachaka's map (`alignment_*.yaml`) and Kachaka's 2D map
+(`occupancy_*.yaml` + `.png`).
 
 ### 2. Call it
 
