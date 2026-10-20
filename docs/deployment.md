@@ -46,7 +46,7 @@ docker run -d --name base_placement --restart unless-stopped --runtime nvidia --
   `max_near_boxes`, the ESDF box); a request that exceeds them fails loudly instead of silently dropping obstacles.
 - The Thor runs in 120 W mode and shares its GPU with other containers; MAXN + `jetson_clocks` would be faster but
   affects everyone on the machine (needs the lab's agreement).
-- Without a GPU on your machine: `python bundle.py | ssh <server> 'cd /tmp && <cuRobo python> -'` packs the code,
+- Development only (not used on the robot): without a GPU on your machine, `python bundle.py | ssh <server> 'cd /tmp && <cuRobo python> -'` packs the code,
   config, robot assets and inputs into one script that unpacks to `/dev/shm` on the server and deletes itself afterwards.
 
 ## Installation (x86_64 + NVIDIA GPU)

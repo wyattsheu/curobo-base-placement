@@ -29,6 +29,13 @@ Grey = SLAM points, blue = wrist camera, red = the bottle, green rectangle = the
 
 ## Use it in the robot system
 
+**It runs locally on the robot's computer (the Thor), inside the arm node's container, as a Python import. There is
+no server.** (`bundle.py` and `run_demo.py --serve` are only development tools for testing from another machine; the
+robot does not use them.)
+
+**It only answers where the base should go: (x, y, yaw).** It gives no joint states and nothing is sent to the arm or
+the servo from this repo. After Kachaka arrives, the arm is planned and executed by mm_actions as today.
+
 ### 1. Start it with the container
 
 Clone it on the Thor next to `mm_system_prod`. It is mounted into the container, so updating is a `git pull` plus a
