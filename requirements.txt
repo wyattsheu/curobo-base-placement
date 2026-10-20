@@ -4,3 +4,4 @@ numpy
 scipy
 PyYAML
 Pillow    # grasp_lab.py: wrist depth images and masks
+matplotlib   # only for find_standpoint(viz_dir=...) debug pictures

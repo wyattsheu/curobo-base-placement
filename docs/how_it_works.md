@@ -69,6 +69,7 @@ only the carton floor as an obstacle.*
 curobo-base-placement/
 ├─ config.yaml           every assumption and parameter
 ├─ base_placement.py     BasePlacement: the one call for the robot system (find_standpoint)
+├─ viz.py                debug pictures for find_standpoint(viz_dir=...)
 ├─ placement.py          BasePlacementPlanner: solvers, set_scene(), plan(), plan_arm()
 ├─ scene_io.py           point cloud + request → PlanningScene (target, drivable area, boxes, ESDF grid)
 ├─ robot_model.py        the 9-DoF cuRobo model (Kachaka x, y, yaw + Piper), safety cone, reach bound

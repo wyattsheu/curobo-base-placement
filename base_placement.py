@@ -75,7 +75,8 @@ class BasePlacement:
         A = np.eye(4); A[:3, :3] = _rot_wxyz(q); A[:3, 3] = xyz
         return B @ A
 
-    def find_standpoint(self, robot_pose, grasps, object_pts=None, scene_pts=None, map_from_arm=None):
+    def find_standpoint(self, robot_pose, grasps, object_pts=None, scene_pts=None, map_from_arm=None, viz_dir=None):
+        """viz_dir: also save one picture per grasp tried (top + side view, why it was accepted or rejected); ~1 s each."""
         t0 = time.perf_counter()
         robot_pose = [float(v) for v in robot_pose]
         G = np.asarray(grasps, float).reshape(-1, 4, 4)[:self.max_grasps]
@@ -99,6 +100,11 @@ class BasePlacement:
                                              self.cfg, target=target, class_names=self.names, occupancy=self.occupancy)
             self.planner.set_scene(scene)
             r = self.planner.plan()
+            if viz_dir is not None:
+                import viz
+                rb = f", {round(r['robustness'] * 27)}/27" if r["ok"] else ""
+                viz.draw(Path(viz_dir) / f"grasp_{i:02d}_{r['reason']}.png", self.cfg, world, scene, r, P, self.occupancy,
+                         title=f"grasp #{i}: {r['reason']}{rb}" + (" (fallback)" if r.get("below_threshold") else ""))
             tried.append({"ok": bool(r["ok"]), "reason": r["reason"], "robustness": float(r.get("robustness") or 0.0),
                           "fallback": bool(r.get("below_threshold")),
                           "pose": [float(v) for v in r["chosen_map"]] if r["ok"] else None})

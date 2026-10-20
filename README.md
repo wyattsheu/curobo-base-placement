@@ -85,6 +85,33 @@ About 1 s per grasp. It tries the grasps in order and returns the first base pos
 the grasp even if Kachaka stops ±5 cm / ±5° off. Otherwise it returns why not: `no_ik_solution`, `outside_cone`,
 `cannot_park` or `not_robust`.
 
+### Debugging: see what the planner saw
+
+Add `viz_dir=` and every grasp tried is saved as a picture, named after its result
+(e.g. `grasp_00_no_ik_solution.png`). Drawing takes ~1 s per grasp, so use it for debugging only.
+
+```python
+r = stack.run(bp.find_standpoint, robot_pose, grasps, object_pts, scene_pts, viz_dir="/tmp/standpoint_viz")
+```
+
+![debug picture](docs/media/viz_no_ik.png)
+
+- **Top view (map frame).**
+  - Points: grey = map, blue = wrist camera, red = target.
+  - Pink = obstacle boxes; dashed red square = the 1 cm grid around the gripper.
+  - Star and arrow = the gripper pose and its approach direction; dashed rectangle = Kachaka now.
+  - Every base pose the IK found is marked by the step that stopped it:
+    - grey ×: target outside the ±30° cone;
+    - orange ×: cannot park;
+    - yellow: fails some of the 27 navigation errors (n/27 shown);
+    - green: 27/27.
+  - Green rectangle = the chosen pose.
+- **Side view.** Points within ±15 cm of the approach line: shows whether the gripper path is blocked, too high or too low.
+- **Title.** The `reason` in words, and how many candidates survived each step.
+
+In the picture above, the gripper must slide in horizontally just above the table, and the clutter behind the bottle
+blocks every way of doing it. No IK solution, so try another grasp.
+
 ### 3. Where it fits in the whole flow
 
 It is **only called when the grasp cannot be done from where the robot stands**.
