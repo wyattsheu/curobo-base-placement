@@ -106,7 +106,11 @@ r = stack.run(bp.find_standpoint, robot_pose, grasps, object_pts, scene_pts, viz
     - yellow: fails some of the 27 navigation errors (n/27 shown);
     - green: 27/27.
   - Green rectangle = the chosen pose.
-- **Side view.** Points within ±15 cm of the approach line: shows whether the gripper path is blocked, too high or too low.
+- **Side view.** Points within ±15 cm of the approach line, and the obstacle boxes / 1 cm grid cells cut by the approach
+  plane: shows whether the gripper path is blocked (by real points or by a box), too high or too low.
+- **3D close-up.** The obstacles the planner actually uses within ±0.6 m of the gripper: box wireframes and the 1 cm
+  grid's obstacle cells. The three boxes closest to the gripper are numbered and listed with name, size and distance
+  (names as in the scene, `c<class>_o<object>_<index>`).
 - **Title.** The `reason` in words, and how many candidates survived each step.
 
 In the picture above, the gripper must slide in horizontally just above the table, and the clutter behind the bottle

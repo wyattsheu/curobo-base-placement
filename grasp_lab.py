@@ -174,6 +174,14 @@ def seen_through(cap, P):
     return out
 
 
+def free_class(sem):
+    """A semantic id the map does not use, for the wrist points (highest free one below 255). They must not share a class
+    with any map points: objects are grouped per class, and wrist points merged with, say, the map's unlabelled points
+    (255) become one object reaching from the floor to the table, boxed as tall solid blocks."""
+    used = set(np.unique(np.asarray(sem)).tolist())
+    return next((c for c in range(254, -1, -1) if c not in used), 255)
+
+
 def fuse(cfg, data, cap, names=None, drop_stale=False):
     """SLAM map with the wrist camera's view replacing it → the npz fields scene_io reads (target_mask marks the object).
     Without a depth image, falls back to SLAM ∪ the recorded clouds."""
@@ -192,12 +200,13 @@ def fuse(cfg, data, cap, names=None, drop_stale=False):
     if obj.any():
         dist, _ = cKDTree(W[obj]).query(P, distance_upper_bound=cfg["map"]["target_grow_m"])
         near_obj = np.isfinite(dist)
+    wc = free_class(data["semantic_ids"])
     return {"means3D": np.vstack([P[keep], W]).astype(np.float32),
-            "semantic_ids": np.r_[np.asarray(data["semantic_ids"])[keep], np.full(len(W), 255)].astype(np.uint8),
+            "semantic_ids": np.r_[np.asarray(data["semantic_ids"])[keep], np.full(len(W), wc)].astype(np.uint8),
             "instance_ids": np.r_[np.asarray(data["instance_ids"])[keep], np.full(len(W), -1)].astype(np.int32),
             "target_mask": np.r_[near_obj[keep], obj],
             "from_wrist": np.r_[np.zeros(int(keep.sum()), bool), np.ones(len(W), bool)],
-            "n_slam_dropped": np.int64(drop.sum()), "stale_instances": np.asarray(stale, np.int64)}
+            "n_slam_dropped": np.int64(drop.sum()), "stale_instances": np.asarray(stale, np.int64), "wrist_class": np.int64(wc)}
 
 
 def requests(cfg, cap, top=6, min_sep_m=0.01, min_sep_deg=10.0):
