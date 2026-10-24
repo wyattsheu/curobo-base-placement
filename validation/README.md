@@ -20,6 +20,7 @@ All need cuRobo and a GPU (see docs/deployment.md). Run from the project root:
 | `bench_lazy.py` | optimiser only where it can change the answer vs before: same stations, scoring time | docs/benchmarks.md |
 | `overcover.py` | near the target: volume the boxes / the ESDF claim that is really empty | docs/benchmarks.md |
 | `bench_bound.py` | bounded scoring and 9 vs 27 perturbations: time and chosen stations, plus run-to-run variation | docs/benchmarks.md |
+| `bench_perturb.py` | which navigation errors to check (full27 / corners9 / xy9 / xy5) and the whole-body IK early stop: time, chosen stations re-scored with all 27 | docs/benchmarks.md |
 
 ```bash
 python validation/run_scenarios.py                        # every scenario
@@ -27,6 +28,7 @@ python validation/run_scenarios.py no_drivable_area       # only these
 python validation/profile_plan.py <lab maps root> auto_20260826 ec129_0813b map803_0930
 python validation/bench_bound.py --lab <lab maps root> auto_20260826 ec129_0813b map803_0930
 python validation/bench_bound.py --requests <grasp_lab.py output>/all.jsonl
+python validation/bench_perturb.py --lab <lab maps root> auto_20260826 ec129_0813b map803_0930
 python validation/overcover.py - config.yaml <lab maps root> map803_0930
 ```
 

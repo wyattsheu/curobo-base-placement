@@ -65,7 +65,7 @@ def main():
     scenes = [(n, f(cfg0)) for n, f in reqs]                          # same scenes for every setting
     rows, chosen9 = [], {}
     for tag, pts, bound in [x for x in SETTINGS if not a.settings or x[0] in a.settings]:
-        cfg = copy.deepcopy(cfg0); cfg["robustness"]["perturb_points"] = pts; cfg["profile"]["bound_scoring"] = bound
+        cfg = copy.deepcopy(cfg0); cfg["robustness"]["perturb_set"] = {27: "full27", 9: "corners9"}[pts]; cfg["profile"]["bound_scoring"] = bound
         torch.cuda.empty_cache()
         pl = BasePlacementPlanner(cfg)
         for name, sc in (scenes[::-1] if tag == "27 reversed" else scenes):
@@ -79,7 +79,7 @@ def main():
                 chosen9[(name, tag)] = r["chosen_base"]
         del pl
     # re-score the 9-point choices with all 27 points
-    cfg = copy.deepcopy(cfg0); cfg["robustness"]["perturb_points"] = 27
+    cfg = copy.deepcopy(cfg0); cfg["robustness"]["perturb_set"] = "full27"
     pl = BasePlacementPlanner(cfg)
     for name, sc in scenes:
         keys = [k for k in chosen9 if k[0] == name]

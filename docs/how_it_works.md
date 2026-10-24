@@ -12,8 +12,8 @@ PlanningScene (base frame = where Kachaka is now)
    │   1 whole_body()     9-DoF IK, one gripper pose → many candidate stations (x, y, yaw)
    │   2 _candidates()    ±30° safety cone; parking_ok(): base clear of obstacles and on drivable cells;
    │                      the current pose is added as the nearest candidate
-   │   3 _lm_pass(), _finish()   each station: 27 navigation errors, 6-DoF IK each (cheap LM stage for all,
-   │                      the expensive optimiser only where it can change the answer); first 27/27 wins
+   │   3 _lm_pass(), _finish()   each station: 9 navigation errors, 6-DoF IK each (cheap LM stage for all,
+   │                      the expensive optimiser only where it can change the answer); first to pass all wins
    ▼
 chosen_map → Navigate_to_pose          (later, separately: set_scene(new scene) → plan_arm() → arm trajectory)
 ```
@@ -43,17 +43,19 @@ only the carton floor as an obstacle.*
 ## Search and scoring (`placement.py`)
 
 - **Whole-body IK**: 128 seeds over base (x, y, yaw) within ±1.5 m of the current pose and the 6 arm joints, all at once
-  for the one gripper pose; more rounds (up to 4) if fewer than 15 parkable candidates come back.
+  for the one gripper pose; more rounds (up to 4) if fewer than 15 parkable candidates come back, but none after a
+  first round that found nothing at all (`profile.wb_stop_if_empty`; later rounds never found anything in 36 of 36 cases).
 - **Filtering**: target within the arm's ±30° safety cone; base spheres clear of the boxes and the footprint on drivable
   cells (Kachaka's 2D map). The current pose is added as a candidate, so a robot that already stands well does not move.
-- **Robustness**: Kachaka never stops exactly. Each candidate is re-solved as a 6-DoF IK at 27 perturbed base poses
-  (every combination of −5/0/+5 cm in x and y and −5/0/+5° in yaw); robustness = the fraction that still reaches the
-  pose. Each perturbation has its own copy of the obstacles (cuRobo multi-env), written in closed form.
+- **Robustness**: Kachaka never stops exactly. Each candidate is re-solved as a 6-DoF IK at perturbed base poses;
+  robustness = the fraction that still reaches the pose. `robustness.perturb_set`: `corners9` (default) = the centre
+  and the 8 corners of ±5 cm in x and y and ±5° in yaw; `full27` = every combination of −/0/+ (the previous default);
+  `xy9` / `xy5` = position errors only (faster, but a third of their picks fail a 5° yaw error; see benchmarks.md). Each perturbation has its own copy of the obstacles (cuRobo multi-env), written in closed form.
 - **Speed**: only obstacles the arm can reach from a station are loaded (a provable 0.887 m bound around the shoulder;
   farther ones contribute exactly zero). IK runs in two stages: Levenberg–Marquardt (cheap) for every station first,
   then the MPPI + L-BFGS optimiser (99% of the cost) only for perturbations LM left unsolved, and only for stations that
   can still change the answer. Any valid solution from either stage counts.
-- **Selection**: nearest first, the first 27/27 station wins; otherwise the most robust one if it reaches `min_accept`.
+- **Selection**: nearest first, the first station that passes every check wins; otherwise the most robust one if it reaches `min_accept`.
 
 ## Frames
 

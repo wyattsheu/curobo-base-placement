@@ -18,7 +18,7 @@ Inputs, exactly as mm_actions already holds them:
 Without object_pts the target is taken as an upright cylinder around the gripper (fine for a bottle or a can).
 
 Result: {"ok", "pose": [x, y, yaw] or None, "grasp_index", "reason", "robustness", "fallback", "time_s", "tried"}.
-Grasps are tried in the given order; the first one with a station that survives every navigation error (27/27) wins.
+Grasps are tried in the given order; the first one with a station that survives every navigation error (e.g. 27/27) wins.
 Otherwise the most robust fallback station is returned (fallback = true), or ok = false with the reason of the first grasp.
 """
 import math
@@ -102,14 +102,14 @@ class BasePlacement:
             r = self.planner.plan()
             if viz_dir is not None:
                 import viz
-                rb = f", {round(r['robustness'] * 27)}/27" if r["ok"] else ""
+                K = r.get("n_perturb", 27); rb = f", {round(r['robustness'] * K)}/{K}" if r["ok"] else ""
                 viz.draw(Path(viz_dir) / f"grasp_{i:02d}_{r['reason']}.png", self.cfg, world, scene, r, P, self.occupancy,
                          title=f"grasp #{i}: {r['reason']}{rb}" + (" (fallback)" if r.get("below_threshold") else ""))
             tried.append({"ok": bool(r["ok"]), "reason": r["reason"], "robustness": float(r.get("robustness") or 0.0),
                           "fallback": bool(r.get("below_threshold")),
                           "pose": [float(v) for v in r["chosen_map"]] if r["ok"] else None})
             if r["ok"] and not r.get("below_threshold"):
-                break                                                            # 27/27: good enough, stop
+                break                                                            # passes every error: good enough, stop
 
         ok = [i for i, t in enumerate(tried) if t["ok"]]
         best = min(ok, key=lambda i: (tried[i]["fallback"], -tried[i]["robustness"], i)) if ok else None

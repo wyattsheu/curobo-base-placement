@@ -59,10 +59,12 @@ class BasePlacementPlanner:
         t0 = time.perf_counter()
         d, a = Rb["perturb_xy_m"], math.radians(Rb["perturb_yaw_deg"])
         self.d = d
-        if Rb.get("perturb_points", 27) == 9:                    # the centre and the 8 corners of the ±xy/±yaw box
-            self.OFFS = np.array([(0.0, 0.0, 0.0)] + [(dx, dy, dp) for dx in (-d, d) for dy in (-d, d) for dp in (-a, a)])
-        else:                                                   # every combination of (-, 0, +) per axis
-            self.OFFS = np.array([(dx, dy, dp) for dx in (-d, 0, d) for dy in (-d, 0, d) for dp in (-a, 0, a)])
+        sets = {"full27": [(dx, dy, dp) for dx in (-d, 0, d) for dy in (-d, 0, d) for dp in (-a, 0, a)],   # every (-, 0, +) per axis
+                "corners9": [(0, 0, 0)] + [(dx, dy, dp) for dx in (-d, d) for dy in (-d, d) for dp in (-a, a)],  # centre + box corners
+                "xy9": [(dx, dy, 0) for dx in (-d, 0, d) for dy in (-d, 0, d)],                           # position only, 3 x 3
+                "xy5": [(0, 0, 0)] + [(dx, dy, 0) for dx in (-d, d) for dy in (-d, d)]}                   # centre + 4 xy corners
+        self.perturb_set = Rb.get("perturb_set") or {9: "corners9"}.get(Rb.get("perturb_points", 27), "full27")
+        self.OFFS = np.array(sets[self.perturb_set], float)
         # every robot sphere, in any arm pose, stays within `reach` of the shoulder (`pivot`): a box farther away never comes
         # within the activation distance of any sphere, so it adds exactly nothing to any cost or collision check
         self.pivot, reach, self.tool_reach = arm_reach(cfg)
@@ -480,6 +482,8 @@ class BasePlacementPlanner:
         while rounds < P["wb_rounds_max"]:
             Q = np.vstack([Q, self._timed("wholebody_ik_s", self.whole_body)]); rounds += 1
             n_cone, U, park = self._timed("filter_s", self._candidates, Q)
+            if not len(Q) and P.get("wb_stop_if_empty", False):
+                break                       # nothing at all in the first round: later rounds have not found any either
             if park.sum() >= P["min_candidates"]:
                 break
         if P.get("try_current_pose", True) and len(Q):
@@ -549,7 +553,7 @@ class BasePlacementPlanner:
                "max_robustness": max(checked.values()) if checked else None,
                "n_success": int(len(Q)), "wb_rounds": rounds, "n_cone": n_cone, "window": self.window,
                "q_success": Q.tolist(), "uniq": U.tolist(), "parked_ok": park.tolist(),
-               "rob": [checked.get(i) for i in range(len(U))], "n_checked": len(checked)}
+               "rob": [checked.get(i) for i in range(len(U))], "n_checked": len(checked), "n_perturb": int(len(self.OFFS))}
         if best is not None:
             ch = tuple(float(v) for v in U[best, :3])
             res.update({"chosen_base": ch, "chosen_map": base_to_map_pose(ch, self.scene.base_pose_in_map),

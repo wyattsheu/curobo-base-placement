@@ -75,6 +75,31 @@ stations: [grasp_lab.md](grasp_lab.md).
   the default pick a different station in 26 of 27 cases (cuRobo's internal random state follows the call sequence).
 - Next: "9 points to search, 27 to confirm" should keep today's quality at nearly the 9-point speed.
 
+## Fewer checks and an early stop: the default since 2026-10-24 (`bench_perturb.py`)
+
+60 requests (3 lab maps × 2 start distances × 10 grasp directions), Thor, one setting after another in the same
+session (other lab containers running, so absolute times vary). "27-check" re-scores each chosen station with all 27.
+
+| Setting | 27/27 found | no IK solution | fallback | 60 requests | up to 10 grasps, stop at first pass (6 runs) | chosen stations passing all 27 |
+|---|---|---|---|---|---|---|
+| full27 (previous default) | 1.55 s | 2.34 s | 5.08 s | 162 s | 78.5 s | 12/12 |
+| full27 + early stop | 1.36 s | 0.83 s | 5.27 s | 113 s | 46.3 s | 11/11 |
+| xy9 (position only) | 0.82 s | 2.31 s | 1.98 s | 117 s | 57.9 s | 8/13 (worst 24/27) |
+| xy5 (position only) | 0.65 s | 2.32 s | 1.51 s | 108 s | 53.4 s | 9/13 (worst 24/27) |
+| xy5 + early stop | 0.64 s | 0.85 s | 1.46 s | 55 s | 25.5 s | 8/12 (worst 22/27) |
+| corners9 | 1.04 s | 2.33 s | 2.18 s | 122 s | 59.5 s | 12/12, the same 12 stations as full27 |
+| **corners9 + early stop (default)** | **0.90 s** | **0.85 s** | **2.45 s** | **69 s** | **31.2 s** | 11/12 (worst 25/27) |
+
+- **Yaw matters**: with the arm reaching 0.5–0.8 m, a 5° heading error moves the gripper 4–7 cm, as much as the
+  position error. Position-only sets (xy9, xy5) pick a station that fails some 5° error a third of the time. Use them only
+  if Kachaka's measured heading error turns out much smaller than 5°.
+- **Early stop**: when the whole-body IK finds nothing in its first round, the next three rounds found nothing either in
+  36 of 36 impossible requests; each round costs ~0.5 s because cuRobo only exits early once a solution exists.
+- Requests where a setting picks a different station than full27 stay within the run-to-run variation (full27 with the
+  requests reversed also differs in one).
+- Overall: 2.3× less time for the 60 requests; trying grasps until the first pass, 2.5× (e.g. 16–21 s → 6–8 s when the
+  first five grasps are impossible).
+
 ## Tried and kept off
 
 - **Cropping the map to the arm's reach** (`map.crop_to_window`, `bench_roi.py`): the 1.8 m ROI is already about the

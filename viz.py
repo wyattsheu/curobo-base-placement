@@ -20,7 +20,7 @@ REASONS = {
     "no_ik_solution": "no base pose nearby lets the arm reach this gripper pose without colliding",
     "outside_cone": "reachable only with the target outside the arm's ±30° cone",
     "cannot_park": "reachable, but Kachaka cannot park at any of those spots",
-    "not_robust": "reachable, but no spot survives at least half of the 27 navigation errors",
+    "not_robust": "reachable, but no spot survives at least half of the navigation errors",
 }
 
 
@@ -141,24 +141,25 @@ def draw(path, cfg, world, scene, res, pinch_map, occupancy=None, title=""):
     if len(Q):
         q = base_to_map_xy(Q[:, :2], base)
         ax.scatter(q[:, 0], q[:, 1], s=10, c="#bdbdbd", marker="x", zorder=4, label=f"IK solution (grey only: target outside the ±30° cone)")
+    K = int(res.get("n_perturb", 27))
     groups = {"cannot park": ([], "#f5a623", "x"), "not checked": ([], "#7fb3e6", "o"),
-              "fails some of 27 errors": ([], "#f8e71c", "o"), "27/27": ([], "#2e7d32", "o")}
+              "fails some navigation errors": ([], "#f8e71c", "o"), "passes all": ([], "#2e7d32", "o")}
     for i in range(len(U)):
         if i < len(park) and not park[i]:
             k = "cannot park"
         elif i >= len(rob) or rob[i] is None:
             k = "not checked"
         else:
-            k = "27/27" if rob[i] >= 1.0 else "fails some of 27 errors"
+            k = "passes all" if rob[i] >= 1.0 else "fails some navigation errors"
         groups[k][0].append(i)
     for k, (idx, c, mk) in groups.items():
         if idx:
             q = base_to_map_xy(U[idx, :2], base)
             ax.scatter(q[:, 0], q[:, 1], s=28, c=c, marker=mk, edgecolors="k" if mk == "o" else None, linewidths=0.4,
                        zorder=5, label=f"{k} ({len(idx)})")
-            if k == "fails some of 27 errors":
+            if k == "fails some navigation errors":
                 for i, p in zip(idx, q):
-                    ax.annotate(f"{round(rob[i] * 27)}/27", p, fontsize=7, xytext=(3, 3), textcoords="offset points")
+                    ax.annotate(f"{round(rob[i] * K)}/{K}", p, fontsize=7, xytext=(3, 3), textcoords="offset points")
     _footprint(ax, base, cfg, facecolor="none", edgecolor="#555555", ls="--", lw=1.5, zorder=6)
     ax.annotate("robot now", base[:2], fontsize=9, xytext=(-30, -18), textcoords="offset points")
     if res.get("ok"):
@@ -255,7 +256,7 @@ def draw(path, cfg, world, scene, res, pinch_map, occupancy=None, title=""):
     ax3.set_title(f"3D close-up (±{CLOSE_R:.1f} m): boxes and 1 cm grid the planner uses")
 
     info = (f"{len(Q)} IK solutions · {res.get('n_cone', 0)} in the ±30° cone · {int(park.sum())} parkable · "
-            f"{res.get('n_checked', 0)} checked against 27 errors")
+            f"{res.get('n_checked', 0)} checked against {res.get('n_perturb', 27)} navigation errors")
     why = REASONS.get(res.get("reason"), "")
     fig.suptitle(f"{title}  —  {why}\n{info}", fontsize=12)
     fig.tight_layout()

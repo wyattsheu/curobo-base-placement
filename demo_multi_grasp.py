@@ -69,7 +69,7 @@ def solve(planner, cfg, world, base_pose, grasp, occupancy):
     r = planner.plan()                                                        # ~0.5–1 s when a 27/27 station exists
     t2 = time.perf_counter()
     out = {"ok": r["ok"], "reason": r["reason"], "below_threshold": r["below_threshold"], "robustness": r["robustness"],
-           "chosen_map": r.get("chosen_map"), "scene_s": t1 - t0, "plan_s": t2 - t1}
+           "chosen_map": r.get("chosen_map"), "scene_s": t1 - t0, "plan_s": t2 - t1, "n_perturb": r.get("n_perturb", 27)}
     if r["ok"]:
         x, y, _ = r["chosen_map"]
         out["drive_m"] = math.hypot(x - base_pose[0], y - base_pose[1])
@@ -123,7 +123,7 @@ def main(argv=None):
         if r["ok"]:
             x, y, yaw = r["chosen_map"]
             verdict = (f"drive to ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°), {r['drive_m']:.2f} m away, "
-                       f"robustness {r['robustness'] * 27:.0f}/27" + (" (fallback)" if r["below_threshold"] else ""))
+                       f"robustness {r['robustness'] * r['n_perturb']:.0f}/{r['n_perturb']}" + (" (fallback)" if r["below_threshold"] else ""))
         else:
             verdict = f"REJECTED: {r['reason']}"
         print(f"{g['name']:22s} {verdict:60s} scene {r['scene_s']:.2f} s + plan {r['plan_s']:.2f} s", flush=True)

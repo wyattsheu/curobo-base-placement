@@ -148,7 +148,7 @@ obstacle and the gripper "collides" at the goal, so IK never succeeds.
 | **`chosen_map`** | **(x, y, yaw), map frame → `Navigate_to_pose`** (only when `ok`) |
 | `chosen_base` | the same station relative to where Kachaka is now |
 | **`at_goal.grasp_pose_in_piper_base`** | the gripper pose in the Piper base frame once Kachaka stands at `chosen_map` → mm_actions `move_arm_to_pose` (added by `run_demo.py`) |
-| `robustness` | fraction of the 27 navigation errors (±5 cm, ±5°) from which the arm still reaches the pose |
+| `robustness` | fraction of the navigation errors checked (default 9: the centre and corners of ±5 cm, ±5°) from which the arm still reaches the pose; `n_perturb` = how many |
 | `below_threshold` | true = no station reached `threshold`; this is the fallback |
 | `max_robustness` | best robustness among the scored stations (how far off a `not_robust` was) |
 | `timing_s`, `memory_mb` | time per step (s), GPU memory (MB) |
@@ -157,7 +157,7 @@ obstacle and the gripper "collides" at the goal, so IK never succeeds.
 
 **Threshold and fallback** (`robustness.threshold`, `min_accept`):
 1. Stations are scored nearest first (the current pose first of all); the first with robustness ≥ `threshold`
-   (1.0 = all 27) is taken.
+   (1.0 = all of them) is taken.
 2. If none reaches it, the most robust scored station is taken (nearest on ties) as long as it reaches `min_accept`
    (0.5); `below_threshold = true`.
 3. Otherwise `ok = false`, `reason = not_robust`. A station that only survives one or two errors is never returned.

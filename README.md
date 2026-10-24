@@ -7,7 +7,8 @@ collisions — even if Kachaka stops ±5 cm / ±5° off. Grasps that cannot be d
 
 - Robot: Kachaka mobile base + AgileX Piper 6-DoF arm (Robot129).
 - Planner: [cuRobo v2](https://github.com/NVlabs/curobo), 9-DoF whole-body IK (base x, y, yaw + 6 arm joints).
-- Runs on the Jetson Thor or any CUDA GPU: about **1 s per grasp** on the Thor once started.
+- Runs on the Jetson Thor or any CUDA GPU: about **0.9 s per grasp** on the Thor once started (0.85 s to reject an
+  impossible one).
 
 It does not choose grasps, plan the navigation path, or build / align maps.
 
@@ -81,7 +82,7 @@ r = stack.run(bp.find_standpoint,
 # r["ok"], r["pose"] = (x, y, yaw) to drive to, r["grasp_index"], r["reason"] if not ok
 ```
 
-About 1 s per grasp. It tries the grasps in order and returns the first base pose from which the arm still reaches
+About 0.9 s per grasp (0.85 s to reject an impossible one). It tries the grasps in order and returns the first base pose from which the arm still reaches
 the grasp even if Kachaka stops ±5 cm / ±5° off. Otherwise it returns why not: `no_ik_solution`, `outside_cone`,
 `cannot_park` or `not_robust`.
 
@@ -103,8 +104,8 @@ r = stack.run(bp.find_standpoint, robot_pose, grasps, object_pts, scene_pts, viz
   - Every base pose the IK found is marked by the step that stopped it:
     - grey ×: target outside the ±30° cone;
     - orange ×: cannot park;
-    - yellow: fails some of the 27 navigation errors (n/27 shown);
-    - green: 27/27.
+    - yellow: fails some of the navigation errors checked (n/9 shown);
+    - green: passes all of them.
   - Green rectangle = the chosen pose.
 - **Side view.** Points within ±15 cm of the approach line, and the obstacle boxes / 1 cm grid cells cut by the approach
   plane: shows whether the gripper path is blocked (by real points or by a box), too high or too low.

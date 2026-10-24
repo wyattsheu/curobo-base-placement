@@ -54,19 +54,24 @@ search:
   yaw_limit_rad: 3.14159
 
 robustness:
-  # 導航到位誤差：±xy、±yaw 各取三點（-, 0, +）共 27 種。← 用 Kachaka 實測誤差取代
+  # 導航到位誤差 ±xy、±yaw。← 用 Kachaka 實測誤差取代
   perturb_xy_m: 0.05
   perturb_yaw_deg: 5.0
-  perturb_points: 27                    # 27 = 每個軸 (-, 0, +) 全部組合；9 = 中心 + 8 個角落（±xy、±yaw 同時取極端）
-  threshold: 1.0                        # 27 種都要抓得到才算通過
+  # 要檢查哪些誤差（Thor 實測，validation/bench_perturb.py，60 個請求）：
+  #   full27   每個軸 (-, 0, +) 全部組合，27 種（舊預設）
+  #   corners9 中心 + 8 個角落（±x、±y、±yaw 同時取極端）：找到站位 1.55 → 0.90 s，選到的站位和 full27 相同（12/12）
+  #   xy9/xy5  只看位置、不看角度（3×3／中心 + 4 角）：再快一點，但 1/3 選到的站位轉歪 5° 就抓不到（最差 22/27）
+  perturb_set: corners9
+  threshold: 1.0                        # 每一種都要抓得到才算通過
   min_accept: 0.5                       # 沒有站位達到 threshold 時，退路只接受穩健度 ≥ 這個值的站位；都不到就回報無解（reason = not_robust）
 
 # 計算量（Thor 輕量設定：和其他程序共用 GPU）
 profile:
   wb_seeds: 128                         # whole-body IK 種子數（只有一個夾爪位姿，一次呼叫）
   wb_rounds_max: 4                      # 候選太少時最多再解幾輪（每輪重新抽種子）
+  wb_stop_if_empty: true                # 第一輪一個解都沒有就停（實測 36/36 後面幾輪也找不到）：無解的抓取 2.3 → 0.85 s
   min_candidates: 15                    # 可停車的候選站位至少要這麼多才開始評分
-  scorer_group: 4                       # 評分：每次 GPU 呼叫評幾個站位（4 × 27 = 108 題）；方塊很多時自動減少
+  scorer_group: 4                       # 評分：每次 GPU 呼叫評幾個站位（4 × 誤差數 題）；方塊很多時自動減少
   scorer_seeds: 8                       # 每題 IK 種子數。LM 種子與最佳化結果取聯集後，真實地圖上 4／8 種子與 32 種子選出同一站位
   # 手臂軌跡規劃不在 plan() 裡：Kachaka 到位、重新確認目標後再呼叫 plan_arm()（run_demo.py --arm）
   build_arm_planner: false               # true：啟動時就建 MotionPlanner（第一次呼叫 plan_arm 不用等）
